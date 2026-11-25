@@ -5,6 +5,8 @@ members = [
     "crates/identity",
     "crates/capture",
     "crates/transport",
+    "crates/rmm",
+    "crates/ai",
     "apps/server",
     "apps/server-console",
     "apps/agent-host",
@@ -25,11 +27,13 @@ base64 = "0.22"
 bincode = "1.3"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+data-encoding = "2.6"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow"] }
 egui = "0.31"
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
 hostname = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 lz4_flex = "0.11"
@@ -37,6 +41,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha1 = "0.10"
 sha2 = "0.10"
 snow = "0.9"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "tls-rustls-ring-webpki"] }
@@ -48,6 +53,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tray-icon = "0.19"
+urlencoding = "2.1"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -57,6 +63,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
@@ -69,3 +77,5 @@ agentdesk-protocol = { path = "crates/protocol" }
 agentdesk-identity = { path = "crates/identity" }
 agentdesk-capture = { path = "crates/capture" }
 agentdesk-transport = { path = "crates/transport" }
+agentdesk-rmm = { path = "crates/rmm" }
+agentdesk-ai = { path = "crates/ai" }

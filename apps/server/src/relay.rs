@@ -131,6 +131,40 @@ async fn handle_agent_socket(
                             )
                             .await;
                         }
+                        AgentToServerMessage::DiagnosticResult {
+                            request_id,
+                            ok,
+                            data,
+                            screenshot_jpeg_b64,
+                            error,
+                        } => {
+                            if let Some(tx_wait) = state.pending_agent_requests.write().await.remove(&request_id) {
+                                let _ = tx_wait.send(json!({
+                                    "ok": ok,
+                                    "data": data,
+                                    "screenshot_jpeg_b64": screenshot_jpeg_b64,
+                                    "error": error,
+                                }));
+                            }
+                        }
+                        AgentToServerMessage::CommandResult {
+                            request_id,
+                            ok,
+                            exit_code,
+                            stdout,
+                            stderr,
+                            duration_ms,
+                        } => {
+                            if let Some(tx_wait) = state.pending_agent_requests.write().await.remove(&request_id) {
+                                let _ = tx_wait.send(json!({
+                                    "ok": ok,
+                                    "exit_code": exit_code,
+                                    "stdout": stdout,
+                                    "stderr": stderr,
+                                    "duration_ms": duration_ms,
+                                }));
+                            }
+                        }
                     }
                 }
             }

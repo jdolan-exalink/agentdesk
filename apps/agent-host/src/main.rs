@@ -1,6 +1,9 @@
 mod config;
 
-use agentdesk_capture::win::{current_process_private_mb, inject_input_event, WindowsCapturer};
+use agentdesk_capture::win::{
+    current_process_private_mb, enumerate_monitors, inject_input_event, inject_special_combo,
+    write_clipboard_text, WindowsCapturer,
+};
 use agentdesk_capture::{encode_frame, ScreenCapturer};
 use agentdesk_identity::DeviceIdentity;
 use agentdesk_protocol::{
@@ -8,9 +11,13 @@ use agentdesk_protocol::{
     FrameEncoding, ServerToAgentMessage, VideoFrame,
 };
 use agentdesk_transport::RelayTunnel;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use clap::{Parser, ValueEnum};
 use config::{normalize_server_url, HostConfig};
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -607,6 +614,42 @@ async fn run_agent(
                                                 }
                                             }
                                         }
+                                        ServerToAgentMessage::RunDiagnostic { request_id, kind } => {
+                                            let tx_rep = ctrl_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let (ok, data, shot, err) = run_diagnostic_sync(&kind);
+                                                let _ = tx_rep.send(AgentToServerMessage::DiagnosticResult {
+                                                    request_id,
+                                                    ok,
+                                                    data,
+                                                    screenshot_jpeg_b64: shot,
+                                                    error: err,
+                                                });
+                                            });
+                                        }
+                                        ServerToAgentMessage::RunCommand {
+                                            request_id,
+                                            shell,
+                                            command,
+                                            timeout_secs,
+                                        } => {
+                                            let tx_rep = ctrl_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let res = agentdesk_rmm::execute_shell_command(
+                                                    &shell,
+                                                    &command,
+                                                    timeout_secs,
+                                                );
+                                                let _ = tx_rep.send(AgentToServerMessage::CommandResult {
+                                                    request_id,
+                                                    ok: res.ok,
+                                                    exit_code: res.exit_code,
+                                                    stdout: res.stdout,
+                                                    stderr: res.stderr,
+                                                    duration_ms: res.duration_ms,
+                                                });
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -645,6 +688,42 @@ async fn run_agent(
     Ok(())
 }
 
+fn run_diagnostic_sync(
+    kind: &str,
+) -> (bool, serde_json::Value, Option<String>, Option<String>) {
+    match kind {
+        "inventory" => (true, agentdesk_rmm::collect_inventory(), None, None),
+        "metrics" => (true, agentdesk_rmm::collect_metrics(), None, None),
+        "services" => (true, agentdesk_rmm::collect_services(), None, None),
+        "events" => (true, agentdesk_rmm::collect_recent_events(), None, None),
+        "screenshot" => {
+            let mut cap = WindowsCapturer::new();
+            match cap.capture_rgba().and_then(|raw| encode_frame(&raw, FrameEncoding::Jpeg, 65)) {
+                Ok(jpg) => {
+                    let b64 = B64.encode(jpg);
+                    (true, serde_json::json!({ "captured": true }), Some(b64), None)
+                }
+                Err(e) => (false, serde_json::json!({}), None, Some(e.to_string())),
+            }
+        }
+        _ => {
+            let data = serde_json::json!({
+                "inventory": agentdesk_rmm::collect_inventory(),
+                "metrics": agentdesk_rmm::collect_metrics(),
+                "services": agentdesk_rmm::collect_services(),
+                "events": agentdesk_rmm::collect_recent_events(),
+            });
+            (true, data, None, None)
+        }
+    }
+}
+
+struct PendingUpload {
+    filename: String,
+    expected_sha256: String,
+    data: Vec<u8>,
+}
+
 async fn run_host_session(
     relay_url: String,
     allow_control: bool,
@@ -655,18 +734,37 @@ async fn run_host_session(
     let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
     tracing::info!("Noise_XX E2EE session established with viewer");
 
+    let monitors = enumerate_monitors();
+    let _ = tunnel
+        .send_packet(&DataPacket::Control(ControlMessage::MonitorList {
+            monitors,
+            active_index: 0,
+        }))
+        .await;
+
     let (pkt_tx, mut pkt_rx) = mpsc::channel::<DataPacket>(4);
     let quality = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(initial_quality));
     let fps = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(initial_fps));
+    let monitor_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let q_cap = quality.clone();
     let f_cap = fps.clone();
+    let m_cap = monitor_idx.clone();
     let cap_stop = stop_rx.clone();
 
     std::thread::spawn(move || {
-        let mut cap = WindowsCapturer::new();
+        let mut active_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
+        let mut cap = WindowsCapturer::new_for_monitor(active_mon);
         let mut seq = 0u64;
         while !*cap_stop.borrow() {
+            let desired_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
+            if desired_mon != active_mon {
+                if cap.switch_monitor(desired_mon) {
+                    active_mon = desired_mon;
+                } else {
+                    m_cap.store(active_mon, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let target_fps = f_cap.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
             let frame_budget = Duration::from_millis(1000 / target_fps);
             let t0 = Instant::now();
@@ -693,6 +791,8 @@ async fn run_host_session(
             }
         }
     });
+
+    let mut uploads: HashMap<Uuid, PendingUpload> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -722,6 +822,60 @@ async fn run_host_session(
                     Ok(DataPacket::Control(ControlMessage::SetQuality { jpeg_quality, max_fps })) => {
                         quality.store(jpeg_quality.clamp(25, 95), std::sync::atomic::Ordering::Relaxed);
                         fps.store(max_fps.clamp(1, 60), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::SelectMonitor { index })) => {
+                        monitor_idx.store(index, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::ClipboardText { text })) => {
+                        if allow_control {
+                            write_clipboard_text(&text);
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::SpecialKey { combo })) => {
+                        if allow_control {
+                            inject_special_combo(&combo);
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FileOffer { transfer_id, filename, size_bytes, sha256 })) => {
+                        if size_bytes <= 64 * 1024 * 1024 {
+                            let safe_name = PathBuf::from(&filename)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("archivo_{transfer_id}.bin"));
+                            uploads.insert(transfer_id, PendingUpload {
+                                filename: safe_name,
+                                expected_sha256: sha256,
+                                data: Vec::with_capacity(size_bytes as usize),
+                            });
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FileChunk { transfer_id, data, eof, .. })) => {
+                        if let Some(up) = uploads.get_mut(&transfer_id) {
+                            up.data.extend_from_slice(&data);
+                            if eof {
+                                let finished = uploads.remove(&transfer_id).unwrap();
+                                let actual_sha = hex::encode(Sha256::digest(&finished.data));
+                                let (ok, msg) = if !finished.expected_sha256.is_empty() && actual_sha != finished.expected_sha256 {
+                                    (false, format!("SHA-256 no coincide para {}", finished.filename))
+                                } else {
+                                    let base = std::env::var("USERPROFILE")
+                                        .map(PathBuf::from)
+                                        .unwrap_or_else(|_| std::env::temp_dir());
+                                    let dest_dir = base.join("Downloads").join("AgentDesk");
+                                    let _ = std::fs::create_dir_all(&dest_dir);
+                                    let dest_path = dest_dir.join(&finished.filename);
+                                    match std::fs::write(&dest_path, &finished.data) {
+                                        Ok(()) => (true, format!("Recibido en {}", dest_path.display())),
+                                        Err(e) => (false, format!("Error escribiendo archivo: {e}")),
+                                    }
+                                };
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::FileAck {
+                                    transfer_id,
+                                    ok,
+                                    message: msg,
+                                })).await;
+                            }
+                        }
                     }
                     Ok(DataPacket::Control(ControlMessage::Terminate { .. })) | Err(_) => {
                         break;

@@ -71,7 +71,9 @@ fn shell(title: &str, body: &str) -> Html<String> {
     <a class="brand" href="/">AgentDesk <span class="badge">Self-Hosted Rust</span></a>
     <nav class="row">
       <a class="btn" href="/downloads">Descargar</a>
+      <a class="btn" href="/docs">Docs</a>
       <a class="btn" href="/support">Solicitar asistencia</a>
+      <a class="btn" href="/support/status">Estado</a>
       <a class="btn primary" href="/app">Consola</a>
     </nav>
   </header>
@@ -495,4 +497,49 @@ const es=new EventSource('/api/v1/events');
 </body>
 </html>"#;
     Html(tpl.replace("__BASE_CSS__", BASE_CSS))
+}
+
+pub async fn docs_page() -> Html<String> {
+    shell(
+        "Documentación",
+        r#"<main class="container">
+  <h1>Documentación y Ayuda — AgentDesk</h1>
+  <p class="muted">Guías rápidas de instalación, acceso desatendido, seguridad E2EE y Copiloto IA.</p>
+  <div id="docs-list" class="grid" style="margin-top:16px;">Cargando documentación...</div>
+  <script>
+  fetch('/api/v1/docs').then(r=>r.json()).then(pages=>{
+    document.getElementById('docs-list').innerHTML=pages.map(p=>`
+      <article class="card">
+        <h2 style="margin-top:0;">${p.title}</h2>
+        <pre style="white-space:pre-wrap;font-family:inherit;margin:0;">${p.body_markdown}</pre>
+      </article>`).join('');
+  });
+  </script>
+</main>"#,
+    )
+}
+
+pub async fn status_page() -> Html<String> {
+    shell(
+        "Estado del Servicio",
+        r#"<main class="container" style="max-width:760px;">
+  <div class="card">
+    <h1 style="margin-top:0;">Estado Operativo de AgentDesk</h1>
+    <p class="muted">Estado agregado del plano de control, relay E2EE y base de datos (sin exponer topología interna ni clientes).</p>
+    <div id="st-badge" class="badge ok">Verificando...</div>
+    <div id="st-meta" class="mono muted" style="margin-top:12px;"></div>
+  </div>
+  <script>
+  fetch('/health/ready').then(r=>r.json()).then(d=>{
+    const b=document.getElementById('st-badge');
+    b.textContent=d.status==='ready'?'● TODOS LOS SERVICIOS OPERATIVOS':'● DEGRADADO';
+    document.getElementById('st-meta').textContent='Servicio: '+d.service+' · Public URL: '+(d.public_url||'local');
+  }).catch(()=>{
+    const b=document.getElementById('st-badge');
+    b.className='badge warn';
+    b.textContent='● SIN CONEXIÓN';
+  });
+  </script>
+</main>"#,
+    )
 }

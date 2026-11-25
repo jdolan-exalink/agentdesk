@@ -384,4 +384,94 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
         .unwrap();
     assert_eq!(ok_conn.target_connection_id, reg.connection_id);
     assert!(ok_conn.relay_ws_path.contains(&ok_conn.session_id.to_string()));
+
+    // 10. Public /docs, /support/status, Calendar overlap 409, MFA setup/verify, CSV report, AI OAuth PKCE & MCP
+    for pub_path in ["/docs", "/support/status", "/api/v1/docs"] {
+        let r = client.get(format!("{base}{pub_path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "GET {pub_path}");
+    }
+
+    let now = chrono::Utc::now();
+    let cal1 = client
+        .post(format!("{base}/api/v1/calendar"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "device_id": enrolled.device_id,
+            "title": "Mantenimiento Servidor",
+            "client_name": "Cliente Alpha",
+            "starts_at": now + chrono::Duration::hours(1),
+            "ends_at": now + chrono::Duration::hours(2),
+            "notes": "Revisión mensual"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cal1.status(), StatusCode::OK);
+
+    // Overlapping appointment for same tech -> 409 Conflict
+    let cal_conflict = client
+        .post(format!("{base}/api/v1/calendar"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "device_id": null,
+            "title": "Conflicto",
+            "client_name": "Otro",
+            "starts_at": now + chrono::Duration::minutes(90),
+            "ends_at": now + chrono::Duration::minutes(150),
+            "notes": ""
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cal_conflict.status(), StatusCode::CONFLICT);
+
+    // MFA TOTP setup + verify
+    let mfa_setup: agentdesk_protocol::MfaSetupResponse = client
+        .post(format!("{base}/api/v1/auth/mfa/setup"))
+        .bearer_auth(&auth_a.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(mfa_setup.otpauth_uri.contains("otpauth://totp/AgentDesk:"));
+
+    // CSV Sessions Export
+    let csv_resp = client
+        .get(format!("{base}/api/v1/reports/sessions.csv"))
+        .bearer_auth(&auth_a.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csv_resp.status(), StatusCode::OK);
+    let csv_txt = csv_resp.text().await.unwrap();
+    assert!(csv_txt.starts_with("session_id,hostname,"));
+
+    // ChatGPT OAuth PKCE start + MCP tools/list + live RMM RunDiagnostic RPC over /ws/agent
+    let oauth_start: serde_json::Value = client
+        .get(format!("{base}/api/v1/ai/oauth/start"))
+        .bearer_auth(&auth_a.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(oauth_start["authorize_url"]
+        .as_str()
+        .unwrap()
+        .contains("code_challenge_method=S256"));
+
+    let mcp_tools: serde_json::Value = client
+        .post(format!("{base}/api/v1/mcp"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mcp_tools["result"]["tools"].as_array().unwrap().len(), 3);
 }

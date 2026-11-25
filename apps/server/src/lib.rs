@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod relay;
+pub mod rmm_ai_api;
 pub mod state;
 pub mod web;
 
@@ -16,7 +17,9 @@ pub fn build_router(state: AppState) -> Router {
         // Public Web Portal
         .route("/", get(web::landing_page))
         .route("/downloads", get(web::downloads_page))
+        .route("/docs", get(web::docs_page))
         .route("/support", get(web::support_page))
+        .route("/support/status", get(web::status_page))
         .route("/setup", get(web::setup_page))
         .route("/login", get(web::login_page))
         .route("/app", get(web::app_dashboard_page))
@@ -58,6 +61,35 @@ pub fn build_router(state: AppState) -> Router {
         // Audit & SSE
         .route("/api/v1/audit", get(api::list_audit))
         .route("/api/v1/events", get(api::sse_events))
+        // Users, RBAC & MFA TOTP
+        .route("/api/v1/users", get(rmm_ai_api::list_users).post(rmm_ai_api::create_user))
+        .route("/api/v1/users/{id}/role", patch(rmm_ai_api::update_user_role))
+        .route("/api/v1/auth/mfa/setup", post(rmm_ai_api::mfa_setup))
+        .route("/api/v1/auth/mfa/verify", post(rmm_ai_api::mfa_verify))
+        // RMM Telemetry & Remote Terminal
+        .route("/api/v1/devices/{id}/diagnostics", post(rmm_ai_api::run_device_diagnostic))
+        .route("/api/v1/devices/{id}/telemetry", get(rmm_ai_api::list_device_telemetry))
+        .route(
+            "/api/v1/devices/{id}/command",
+            get(rmm_ai_api::list_device_commands).post(rmm_ai_api::run_device_command),
+        )
+        // AI Copilot (ChatGPT OAuth PKCE / OpenAI / Ollama) & MCP
+        .route("/api/v1/ai/settings", get(rmm_ai_api::get_ai_settings).put(rmm_ai_api::update_ai_settings))
+        .route("/api/v1/ai/oauth/start", get(rmm_ai_api::ai_oauth_start))
+        .route("/api/v1/ai/oauth/callback", get(rmm_ai_api::ai_oauth_callback))
+        .route("/api/v1/ai/chat", post(rmm_ai_api::ai_chat))
+        .route("/api/v1/ai/execute-action", post(rmm_ai_api::ai_execute_approved_action))
+        .route("/api/v1/mcp", post(rmm_ai_api::mcp_rpc_handler))
+        // Calendar, Ticket Comments, CSV Reports & Docs
+        .route("/api/v1/calendar", get(rmm_ai_api::list_calendar_events).post(rmm_ai_api::create_calendar_event))
+        .route("/api/v1/calendar/{id}", delete(rmm_ai_api::delete_calendar_event))
+        .route(
+            "/api/v1/tickets/{id}/comments",
+            get(rmm_ai_api::list_ticket_comments).post(rmm_ai_api::create_ticket_comment),
+        )
+        .route("/api/v1/reports/sessions.csv", get(rmm_ai_api::export_sessions_csv))
+        .route("/api/v1/docs", get(rmm_ai_api::list_docs))
+        .route("/api/v1/docs/{slug}", post(rmm_ai_api::upsert_doc).put(rmm_ai_api::upsert_doc))
         // WebSockets (Agent Control + Blind E2EE Relay)
         .route("/ws/agent", get(relay::ws_agent_handler))
         .route("/ws/relay/{session_id}", get(relay::ws_relay_handler))

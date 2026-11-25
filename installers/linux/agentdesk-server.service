@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentDesk Central Server (Control Plane & Blind E2EE Relay)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentdesk
+Group=agentdesk
+Environment=AGENTDESK_BIND=0.0.0.0:8080
+Environment=DATABASE_URL=postgres://agentdesk:agentdesk_dev_pass@127.0.0.1:5432/agentdesk
+Environment=AGENTDESK_ARTIFACTS_DIR=/opt/agentdesk/artifacts
+ExecStart=/usr/local/bin/agentdesk-server
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

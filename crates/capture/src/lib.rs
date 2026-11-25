@@ -1,4 +1,4 @@
-use agentdesk_protocol::{FrameEncoding, InputEvent, MouseBtn};
+use agentdesk_protocol::{FrameEncoding, InputEvent, MonitorInfo, MouseBtn};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ColorType, ImageReader};
 use std::io::Cursor;
@@ -112,6 +112,11 @@ pub mod win {
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         SRCCOPY,
     };
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
     };
@@ -121,11 +126,84 @@ pub mod win {
     use windows::Win32::System::Threading::GetCurrentProcess;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
+        KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+    const CF_UNICODETEXT_U32: u32 = 13;
+
+    pub fn enumerate_monitors() -> Vec<MonitorInfo> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut device: Option<ID3D11Device> = None;
+            if D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .is_ok()
+            {
+                if let Some(dev) = device {
+                    if let Ok(dxgi_dev) = dev.cast::<IDXGIDevice>() {
+                        if let Ok(adapter) = dxgi_dev.GetAdapter() {
+                            let mut idx = 0u32;
+                            while let Ok(output) = adapter.EnumOutputs(idx) {
+                                if let Ok(desc) = output.GetDesc() {
+                                    let raw_name: Vec<u16> = desc
+                                        .DeviceName
+                                        .iter()
+                                        .copied()
+                                        .take_while(|&c| c != 0)
+                                        .collect();
+                                    let name = String::from_utf16_lossy(&raw_name);
+                                    let w = (desc.DesktopCoordinates.right
+                                        - desc.DesktopCoordinates.left)
+                                        .max(1) as u32;
+                                    let h = (desc.DesktopCoordinates.bottom
+                                        - desc.DesktopCoordinates.top)
+                                        .max(1) as u32;
+                                    let primary = desc.DesktopCoordinates.left == 0
+                                        && desc.DesktopCoordinates.top == 0;
+                                    out.push(MonitorInfo {
+                                        index: idx as usize,
+                                        name: if name.is_empty() {
+                                            format!("Monitor {}", idx + 1)
+                                        } else {
+                                            name
+                                        },
+                                        width: w,
+                                        height: h,
+                                        is_primary: primary,
+                                    });
+                                }
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if out.is_empty() {
+                let w = GetSystemMetrics(SM_CXSCREEN).max(1) as u32;
+                let h = GetSystemMetrics(SM_CYSCREEN).max(1) as u32;
+                out.push(MonitorInfo {
+                    index: 0,
+                    name: "Monitor Principal".into(),
+                    width: w,
+                    height: h,
+                    is_primary: true,
+                });
+            }
+        }
+        out
+    }
 
     fn attach_input_desktop() {
         unsafe {
@@ -149,7 +227,7 @@ pub mod win {
     }
 
     impl DxgiState {
-        fn new() -> Result<Self, CaptureError> {
+        fn new_for_monitor(monitor_idx: usize) -> Result<Self, CaptureError> {
             unsafe {
                 let mut device: Option<ID3D11Device> = None;
                 let mut context: Option<ID3D11DeviceContext> = None;
@@ -177,8 +255,9 @@ pub mod win {
                     .GetAdapter()
                     .map_err(|e| CaptureError::Backend(format!("GetAdapter: {e}")))?;
                 let output = adapter
-                    .EnumOutputs(0)
-                    .map_err(|e| CaptureError::Backend(format!("EnumOutputs(0): {e}")))?;
+                    .EnumOutputs(monitor_idx as u32)
+                    .or_else(|_| adapter.EnumOutputs(0))
+                    .map_err(|e| CaptureError::Backend(format!("EnumOutputs({monitor_idx}): {e}")))?;
                 let output1: IDXGIOutput1 = output
                     .cast()
                     .map_err(|e| CaptureError::Backend(format!("IDXGIOutput1: {e}")))?;
@@ -361,11 +440,15 @@ pub mod win {
 
     impl WindowsCapturer {
         pub fn new() -> Self {
+            Self::new_for_monitor(0)
+        }
+
+        pub fn new_for_monitor(monitor_idx: usize) -> Self {
             attach_input_desktop();
-            match DxgiState::new() {
+            match DxgiState::new_for_monitor(monitor_idx) {
                 Ok(dx) => {
                     let (w, h) = (dx.width, dx.height);
-                    tracing::info!(width = w, height = h, "DXGI Desktop Duplication initialized");
+                    tracing::info!(width = w, height = h, monitor_idx, "DXGI Desktop Duplication initialized");
                     Self {
                         dxgi: Some(dx),
                         width: w,
@@ -388,6 +471,18 @@ pub mod win {
                         backend: CaptureBackend::Gdi,
                     }
                 }
+            }
+        }
+
+        pub fn switch_monitor(&mut self, monitor_idx: usize) -> bool {
+            if let Ok(dx) = DxgiState::new_for_monitor(monitor_idx) {
+                self.width = dx.width;
+                self.height = dx.height;
+                self.dxgi = Some(dx);
+                self.backend = CaptureBackend::Dxgi;
+                true
+            } else {
+                false
             }
         }
     }
@@ -419,6 +514,40 @@ pub mod win {
 
     pub fn inject_input_event(ev: &InputEvent) {
         unsafe {
+            match ev {
+                InputEvent::UnicodeChar { ch } => {
+                    let mut buf = [0u16; 2];
+                    for code in ch.encode_utf16(&mut buf).iter().copied() {
+                        let down = INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 {
+                                ki: KEYBDINPUT {
+                                    wVk: VIRTUAL_KEY(0),
+                                    wScan: code,
+                                    dwFlags: KEYEVENTF_UNICODE,
+                                    time: 0,
+                                    dwExtraInfo: 0,
+                                },
+                            },
+                        };
+                        let up = INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 {
+                                ki: KEYBDINPUT {
+                                    wVk: VIRTUAL_KEY(0),
+                                    wScan: code,
+                                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                                    time: 0,
+                                    dwExtraInfo: 0,
+                                },
+                            },
+                        };
+                        let _ = SendInput(&[down, up], std::mem::size_of::<INPUT>() as i32);
+                    }
+                    return;
+                }
+                _ => {}
+            }
             let input = match ev {
                 InputEvent::MouseMoveNorm { x, y } => {
                     let nx = (x.clamp(0.0, 1.0) * 65535.0) as i32;
@@ -482,8 +611,87 @@ pub mod win {
                         },
                     },
                 },
+                InputEvent::UnicodeChar { .. } => unreachable!(),
             };
             let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+
+    pub fn inject_special_combo(combo: &str) {
+        let key_evt = |vk: u16, pressed: bool| {
+            inject_input_event(&InputEvent::Key { vk, pressed });
+        };
+        match combo {
+            "Win" => {
+                key_evt(0x5B, true);
+                key_evt(0x5B, false);
+            }
+            "Alt+Tab" => {
+                key_evt(0x12, true);
+                key_evt(0x09, true);
+                key_evt(0x09, false);
+                key_evt(0x12, false);
+            }
+            "Ctrl+Shift+Esc" | "Ctrl+Alt+Del" => {
+                key_evt(0x11, true);
+                key_evt(0x10, true);
+                key_evt(0x1B, true);
+                key_evt(0x1B, false);
+                key_evt(0x10, false);
+                key_evt(0x11, false);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn read_clipboard_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+            let result = (|| {
+                let handle = GetClipboardData(CF_UNICODETEXT_U32).ok()?;
+                let hmem = HGLOBAL(handle.0);
+                let ptr = GlobalLock(hmem) as *const u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 65536 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                let text = String::from_utf16_lossy(slice);
+                let _ = GlobalUnlock(hmem);
+                Some(text)
+            })();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
+    pub fn write_clipboard_text(text: &str) -> bool {
+        unsafe {
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            let byte_len = wide.len() * std::mem::size_of::<u16>();
+            let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, byte_len) else {
+                return false;
+            };
+            let ptr = GlobalLock(hmem) as *mut u16;
+            if ptr.is_null() {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            let _ = GlobalUnlock(hmem);
+
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let _ = EmptyClipboard();
+            let ok = SetClipboardData(CF_UNICODETEXT_U32, HANDLE(hmem.0)).is_ok();
+            let _ = CloseClipboard();
+            ok
         }
     }
 
@@ -513,6 +721,28 @@ pub mod win {
         pub fn new() -> Self {
             Self
         }
+        pub fn new_for_monitor(_idx: usize) -> Self {
+            Self
+        }
+        pub fn switch_monitor(&mut self, _idx: usize) -> bool {
+            false
+        }
+    }
+    pub fn enumerate_monitors() -> Vec<MonitorInfo> {
+        vec![MonitorInfo {
+            index: 0,
+            name: "Stub Monitor".into(),
+            width: 640,
+            height: 360,
+            is_primary: true,
+        }]
+    }
+    pub fn inject_special_combo(_combo: &str) {}
+    pub fn read_clipboard_text() -> Option<String> {
+        None
+    }
+    pub fn write_clipboard_text(_text: &str) -> bool {
+        false
     }
     impl ScreenCapturer for WindowsCapturer {
         fn capture_rgba(&mut self) -> Result<RawFrame, CaptureError> {

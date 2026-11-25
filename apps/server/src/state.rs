@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -22,6 +22,8 @@ pub struct AppState {
     pub bootstrap_token: String,
     pub active_agents: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<ServerToAgentMessage>>>>,
     pub relay_rooms: Arc<RwLock<HashMap<Uuid, RelayRoom>>>,
+    pub pending_agent_requests: Arc<RwLock<HashMap<Uuid, oneshot::Sender<serde_json::Value>>>>,
+    pub pending_oauth_states: Arc<RwLock<HashMap<String, (Uuid, String, String)>>>,
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub artifacts_dir: PathBuf,
     pub bind_addr: String,
@@ -37,6 +39,8 @@ impl AppState {
             bootstrap_token,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
             relay_rooms: Arc::new(RwLock::new(HashMap::new())),
+            pending_agent_requests: Arc::new(RwLock::new(HashMap::new())),
+            pending_oauth_states: Arc::new(RwLock::new(HashMap::new())),
             events_tx,
             artifacts_dir,
             bind_addr: "0.0.0.0:8080".to_string(),

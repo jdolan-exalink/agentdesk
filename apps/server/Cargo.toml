@@ -9,22 +9,30 @@ name = "agentdesk-server"
 path = "src/main.rs"
 
 [dependencies]
+agentdesk-ai.workspace = true
 agentdesk-identity.workspace = true
 agentdesk-protocol.workspace = true
+agentdesk-rmm.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+data-encoding.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+urlencoding.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1,23 +1,33 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod panels;
 mod theme;
 
-use agentdesk_capture::win::{current_process_private_mb, inject_input_event, WindowsCapturer};
+use agentdesk_capture::win::{
+    current_process_private_mb, enumerate_monitors, inject_input_event, inject_special_combo,
+    read_clipboard_text, write_clipboard_text, WindowsCapturer,
+};
 use agentdesk_capture::{decode_frame_to_rgba, encode_frame, ScreenCapturer};
 use agentdesk_identity::DeviceIdentity;
 use agentdesk_protocol::{
-    AddressBookEntryDto, AgentToServerMessage, AuthResponse, ControlMessage,
-    CreateEnrollmentResponse, CreateSessionRequest, CreateSessionResponse, DataPacket, DeviceDto,
-    DirectConnectRequest, DirectConnectResponse, FrameEncoding, InputEvent, LoginRequest, MouseBtn,
-    QuickRegisterRequest, QuickRegisterResponse, RotatePasswordRequest, ServerToAgentMessage,
-    SupportTicketDto, UpsertAddressBookRequest, VideoFrame,
+    AddressBookEntryDto, AgentToServerMessage, AiChatResponse, AiProposedActionDto,
+    AiSettingsDto, AuthResponse, CalendarEventDto, ControlMessage, CreateEnrollmentResponse,
+    CreateSessionRequest, CreateSessionResponse, DataPacket, DeviceDto, DirectConnectRequest,
+    DirectConnectResponse, FrameEncoding, InputEvent, LoginRequest, MfaSetupResponse, MonitorInfo,
+    MouseBtn, QuickRegisterRequest, QuickRegisterResponse, RmmCommandDto, RotatePasswordRequest,
+    ServerToAgentMessage, SupportTicketDto, UpsertAddressBookRequest, UserDto, VideoFrame,
 };
 use agentdesk_transport::RelayTunnel;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use config::{detect_lan_ip, normalize_server_url, DesktopConfig};
 use eframe::egui::{self, FontId, RichText};
 use futures_util::{SinkExt, StreamExt};
+use panels::egui_key_to_vk;
 use rand::Rng;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -33,6 +43,10 @@ enum NavTab {
     Agenda,
     Devices,
     Tickets,
+    AiCopilot,
+    Rmm,
+    Calendar,
+    UsersMfa,
     Viewer,
     Settings,
 }
@@ -79,7 +93,22 @@ enum UiEvent {
     },
     RemoteRtt(u64),
     RemoteChat(String, String),
+    RemoteMonitors {
+        monitors: Vec<MonitorInfo>,
+        active_index: usize,
+    },
+    RemoteClipboard(String),
+    RemoteFileAck(String),
     SessionEnded(String),
+    AiSettingsLoaded(AiSettingsDto),
+    AiOAuthUrl(String),
+    AiChatResult(AiChatResponse),
+    AiActionExecuted(RmmCommandDto),
+    RmmDiagnosticResult(serde_json::Value),
+    RmmCommandResult(RmmCommandDto),
+    CalendarLoaded(Vec<CalendarEventDto>),
+    UsersLoaded(Vec<UserDto>),
+    MfaSetupResult(MfaSetupResponse),
 }
 
 struct ActiveViewer {
@@ -98,6 +127,10 @@ struct ActiveViewer {
     chat_input: String,
     chat_log: Vec<String>,
     last_mouse_norm: (f32, f32),
+    monitors: Vec<MonitorInfo>,
+    active_monitor: usize,
+    file_path_input: String,
+    file_status: String,
 }
 
 struct IncomingControl {
@@ -162,6 +195,49 @@ struct AgentDeskApp {
     enroll_cmd_out: String,
     pending_deeplink_connect: Option<Uuid>,
     viewer: Option<ActiveViewer>,
+
+    // AI Copilot state
+    ai_settings: Option<AiSettingsDto>,
+    ai_provider: String,
+    ai_model: String,
+    ai_base_url: String,
+    ai_api_key: String,
+    ai_oauth_client_id: String,
+    ai_oauth_manual_token: String,
+    ai_autonomy: String,
+    ai_redact_pii: bool,
+    ai_device_idx: usize,
+    ai_include_diag: bool,
+    ai_include_shot: bool,
+    ai_prompt: String,
+    ai_messages: Vec<(String, String)>,
+    ai_proposed_actions: Vec<AiProposedActionDto>,
+    ai_busy: bool,
+    ai_oauth_url: String,
+
+    // RMM state
+    rmm_device_idx: usize,
+    rmm_shell: String,
+    rmm_command: String,
+    rmm_diag_output: String,
+    rmm_cmd_output: String,
+
+    // Calendar state
+    calendar_events: Vec<CalendarEventDto>,
+    cal_title: String,
+    cal_client: String,
+    cal_notes: String,
+    cal_hours_from_now: String,
+    cal_duration_mins: String,
+
+    // Users & MFA state
+    users: Vec<UserDto>,
+    new_user_email: String,
+    new_user_name: String,
+    new_user_pw: String,
+    new_user_role: String,
+    mfa_setup: Option<MfaSetupResponse>,
+    mfa_code_input: String,
 }
 
 fn generate_random_password() -> String {
@@ -246,6 +322,41 @@ impl AgentDeskApp {
             enroll_cmd_out: String::new(),
             pending_deeplink_connect,
             viewer: None,
+            ai_settings: None,
+            ai_provider: "chat_gpt_o_auth".into(),
+            ai_model: "gpt-4o-mini".into(),
+            ai_base_url: "https://api.openai.com/v1".into(),
+            ai_api_key: String::new(),
+            ai_oauth_client_id: "agentdesk-desktop-client".into(),
+            ai_oauth_manual_token: String::new(),
+            ai_autonomy: "human_approved_exec".into(),
+            ai_redact_pii: true,
+            ai_device_idx: 0,
+            ai_include_diag: true,
+            ai_include_shot: false,
+            ai_prompt: String::new(),
+            ai_messages: Vec::new(),
+            ai_proposed_actions: Vec::new(),
+            ai_busy: false,
+            ai_oauth_url: String::new(),
+            rmm_device_idx: 0,
+            rmm_shell: "powershell".into(),
+            rmm_command: String::new(),
+            rmm_diag_output: String::new(),
+            rmm_cmd_output: String::new(),
+            calendar_events: Vec::new(),
+            cal_title: String::new(),
+            cal_client: String::new(),
+            cal_notes: String::new(),
+            cal_hours_from_now: "2".into(),
+            cal_duration_mins: "60".into(),
+            users: Vec::new(),
+            new_user_email: String::new(),
+            new_user_name: String::new(),
+            new_user_pw: String::new(),
+            new_user_role: "technician".into(),
+            mfa_setup: None,
+            mfa_code_input: String::new(),
         };
 
         app.start_embedded_host(cc.egui_ctx.clone());
@@ -497,6 +608,42 @@ impl AgentDeskApp {
                                                     }
                                                     let _ = ui_tx.send(UiEvent::IncomingControlEnded);
                                                     ctx.request_repaint();
+                                                }
+                                                ServerToAgentMessage::RunDiagnostic { request_id, kind } => {
+                                                    let tx_rep = ctrl_tx.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        let (ok, data, shot, err) = run_local_diagnostic(&kind);
+                                                        let _ = tx_rep.send(AgentToServerMessage::DiagnosticResult {
+                                                            request_id,
+                                                            ok,
+                                                            data,
+                                                            screenshot_jpeg_b64: shot,
+                                                            error: err,
+                                                        });
+                                                    });
+                                                }
+                                                ServerToAgentMessage::RunCommand {
+                                                    request_id,
+                                                    shell,
+                                                    command,
+                                                    timeout_secs,
+                                                } => {
+                                                    let tx_rep = ctrl_tx.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        let res = agentdesk_rmm::execute_shell_command(
+                                                            &shell,
+                                                            &command,
+                                                            timeout_secs,
+                                                        );
+                                                        let _ = tx_rep.send(AgentToServerMessage::CommandResult {
+                                                            request_id,
+                                                            ok: res.ok,
+                                                            exit_code: res.exit_code,
+                                                            stdout: res.stdout,
+                                                            stderr: res.stderr,
+                                                            duration_ms: res.duration_ms,
+                                                        });
+                                                    });
                                                 }
                                             }
                                         }
@@ -839,6 +986,10 @@ impl AgentDeskApp {
             chat_input: String::new(),
             chat_log: Vec::new(),
             last_mouse_norm: (0.0, 0.0),
+            monitors: Vec::new(),
+            active_monitor: 0,
+            file_path_input: String::new(),
+            file_status: String::new(),
         });
         self.tab = NavTab::Viewer;
         self.connect_feedback.clear();
@@ -890,6 +1041,17 @@ impl AgentDeskApp {
                             }
                             Ok(DataPacket::Control(ControlMessage::Chat { sender, text })) => {
                                 let _ = ui_tx.send(UiEvent::RemoteChat(sender, text));
+                            }
+                            Ok(DataPacket::Control(ControlMessage::MonitorList { monitors, active_index })) => {
+                                let _ = ui_tx.send(UiEvent::RemoteMonitors { monitors, active_index });
+                            }
+                            Ok(DataPacket::Control(ControlMessage::ClipboardText { text })) => {
+                                write_clipboard_text(&text);
+                                let _ = ui_tx.send(UiEvent::RemoteClipboard(text));
+                            }
+                            Ok(DataPacket::Control(ControlMessage::FileAck { ok, message, .. })) => {
+                                let prefix = if ok { "✓ " } else { "✗ " };
+                                let _ = ui_tx.send(UiEvent::RemoteFileAck(format!("{prefix}{message}")));
                             }
                             Ok(DataPacket::Control(ControlMessage::Terminate { reason })) => {
                                 let _ = ui_tx.send(UiEvent::SessionEnded(reason));
@@ -978,6 +1140,7 @@ impl AgentDeskApp {
                     );
                     self.auth = Some(auth);
                     self.refresh_data();
+                    self.load_extra_tabs_data();
                     if let Some(did) = self.pending_deeplink_connect.take() {
                         self.start_session(did, None, true, format!("Equipo {did}"));
                     }
@@ -1053,6 +1216,21 @@ impl AgentDeskApp {
                         v.chat_log.push(format!("{sender}: {text}"));
                     }
                 }
+                UiEvent::RemoteMonitors { monitors, active_index } => {
+                    if let Some(v) = &mut self.viewer {
+                        v.monitors = monitors;
+                        v.active_monitor = active_index;
+                    }
+                }
+                UiEvent::RemoteClipboard(txt) => {
+                    self.status_msg = format!("Portapapeles recibido ({} caracteres)", txt.len());
+                }
+                UiEvent::RemoteFileAck(msg) => {
+                    if let Some(v) = &mut self.viewer {
+                        v.file_status = msg.clone();
+                    }
+                    self.status_msg = msg;
+                }
                 UiEvent::SessionEnded(reason) => {
                     self.viewer = None;
                     self.status_msg = format!("Sesión finalizada: {reason}");
@@ -1060,9 +1238,98 @@ impl AgentDeskApp {
                         self.tab = NavTab::Connect;
                     }
                 }
+                UiEvent::AiSettingsLoaded(s) => {
+                    self.ai_provider = s.provider.clone();
+                    self.ai_model = s.model.clone();
+                    self.ai_base_url = s.base_url.clone();
+                    self.ai_oauth_client_id = s.oauth_client_id.clone();
+                    self.ai_autonomy = s.autonomy_level.clone();
+                    self.ai_redact_pii = s.redact_pii;
+                    self.ai_settings = Some(s);
+                }
+                UiEvent::AiOAuthUrl(url) => {
+                    self.ai_oauth_url = url;
+                    self.status_msg = "Navegador abierto para conectar con ChatGPT OAuth".into();
+                }
+                UiEvent::AiChatResult(res) => {
+                    self.ai_busy = false;
+                    self.ai_messages.push((
+                        format!("IA ({}/{})", res.provider_used, res.model_used),
+                        res.reply,
+                    ));
+                    self.ai_proposed_actions = res.proposed_actions;
+                }
+                UiEvent::AiActionExecuted(cmd) => {
+                    let msg = format!(
+                        "[Acción aprobada exit={}] {}\n{}",
+                        cmd.exit_code, cmd.command, cmd.stdout
+                    );
+                    self.ai_messages.push(("Resultado".into(), msg));
+                }
+                UiEvent::RmmDiagnosticResult(v) => {
+                    self.rmm_diag_output = serde_json::to_string_pretty(&v).unwrap_or_default();
+                }
+                UiEvent::RmmCommandResult(cmd) => {
+                    self.rmm_cmd_output = format!(
+                        "$ {} ({} ms, exit={})\n{}{}",
+                        cmd.command,
+                        cmd.duration_ms,
+                        cmd.exit_code,
+                        cmd.stdout,
+                        if cmd.stderr.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n[stderr]\n{}", cmd.stderr)
+                        }
+                    );
+                }
+                UiEvent::CalendarLoaded(list) => {
+                    self.calendar_events = list;
+                }
+                UiEvent::UsersLoaded(list) => {
+                    self.users = list;
+                }
+                UiEvent::MfaSetupResult(ms) => {
+                    self.mfa_setup = Some(ms);
+                }
             }
         }
     }
+}
+
+fn run_local_diagnostic(
+    kind: &str,
+) -> (bool, serde_json::Value, Option<String>, Option<String>) {
+    match kind {
+        "inventory" => (true, agentdesk_rmm::collect_inventory(), None, None),
+        "metrics" => (true, agentdesk_rmm::collect_metrics(), None, None),
+        "services" => (true, agentdesk_rmm::collect_services(), None, None),
+        "events" => (true, agentdesk_rmm::collect_recent_events(), None, None),
+        "screenshot" => {
+            let mut cap = WindowsCapturer::new();
+            match cap.capture_rgba().and_then(|raw| encode_frame(&raw, FrameEncoding::Jpeg, 65)) {
+                Ok(jpg) => (true, serde_json::json!({ "captured": true }), Some(B64.encode(jpg)), None),
+                Err(e) => (false, serde_json::json!({}), None, Some(e.to_string())),
+            }
+        }
+        _ => (
+            true,
+            serde_json::json!({
+                "inventory": agentdesk_rmm::collect_inventory(),
+                "metrics": agentdesk_rmm::collect_metrics(),
+                "services": agentdesk_rmm::collect_services(),
+                "events": agentdesk_rmm::collect_recent_events(),
+            }),
+            None,
+            None,
+        ),
+    }
+}
+
+struct PendingHostUpload {
+    filename: String,
+    expected_sha256: String,
+    data: Vec<u8>,
 }
 
 async fn run_incoming_host_session(
@@ -1071,18 +1338,37 @@ async fn run_incoming_host_session(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
+    let monitors = enumerate_monitors();
+    let _ = tunnel
+        .send_packet(&DataPacket::Control(ControlMessage::MonitorList {
+            monitors,
+            active_index: 0,
+        }))
+        .await;
+
     let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<DataPacket>(4);
     let quality = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(72));
     let fps = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(24));
+    let monitor_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let q_cap = quality.clone();
     let f_cap = fps.clone();
+    let m_cap = monitor_idx.clone();
     let cap_stop = stop_rx.clone();
 
     std::thread::spawn(move || {
-        let mut cap = WindowsCapturer::new();
+        let mut active_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
+        let mut cap = WindowsCapturer::new_for_monitor(active_mon);
         let mut seq = 0u64;
         while !*cap_stop.borrow() {
+            let desired_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
+            if desired_mon != active_mon {
+                if cap.switch_monitor(desired_mon) {
+                    active_mon = desired_mon;
+                } else {
+                    m_cap.store(active_mon, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let target_fps = f_cap.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
             let frame_budget = Duration::from_millis(1000 / target_fps);
             let t0 = Instant::now();
@@ -1109,6 +1395,8 @@ async fn run_incoming_host_session(
             }
         }
     });
+
+    let mut uploads: HashMap<Uuid, PendingHostUpload> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1138,6 +1426,60 @@ async fn run_incoming_host_session(
                     Ok(DataPacket::Control(ControlMessage::SetQuality { jpeg_quality, max_fps })) => {
                         quality.store(jpeg_quality.clamp(25, 95), std::sync::atomic::Ordering::Relaxed);
                         fps.store(max_fps.clamp(1, 60), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::SelectMonitor { index })) => {
+                        monitor_idx.store(index, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::ClipboardText { text })) => {
+                        if allow_control {
+                            write_clipboard_text(&text);
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::SpecialKey { combo })) => {
+                        if allow_control {
+                            inject_special_combo(&combo);
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FileOffer { transfer_id, filename, size_bytes, sha256 })) => {
+                        if size_bytes <= 64 * 1024 * 1024 {
+                            let safe_name = PathBuf::from(&filename)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("archivo_{transfer_id}.bin"));
+                            uploads.insert(transfer_id, PendingHostUpload {
+                                filename: safe_name,
+                                expected_sha256: sha256,
+                                data: Vec::with_capacity(size_bytes as usize),
+                            });
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FileChunk { transfer_id, data, eof, .. })) => {
+                        if let Some(up) = uploads.get_mut(&transfer_id) {
+                            up.data.extend_from_slice(&data);
+                            if eof {
+                                let finished = uploads.remove(&transfer_id).unwrap();
+                                let actual_sha = hex::encode(Sha256::digest(&finished.data));
+                                let (ok, msg) = if !finished.expected_sha256.is_empty() && actual_sha != finished.expected_sha256 {
+                                    (false, format!("SHA-256 inválido para {}", finished.filename))
+                                } else {
+                                    let base = std::env::var("USERPROFILE")
+                                        .map(PathBuf::from)
+                                        .unwrap_or_else(|_| std::env::temp_dir());
+                                    let dest_dir = base.join("Downloads").join("AgentDesk");
+                                    let _ = std::fs::create_dir_all(&dest_dir);
+                                    let dest_path = dest_dir.join(&finished.filename);
+                                    match std::fs::write(&dest_path, &finished.data) {
+                                        Ok(()) => (true, format!("Recibido en {}", dest_path.display())),
+                                        Err(e) => (false, format!("Error archivo: {e}")),
+                                    }
+                                };
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::FileAck {
+                                    transfer_id,
+                                    ok,
+                                    message: msg,
+                                })).await;
+                            }
+                        }
                     }
                     Ok(DataPacket::Control(ControlMessage::Terminate { .. })) | Err(_) => {
                         break;
@@ -1248,6 +1590,11 @@ impl eframe::App for AgentDeskApp {
                     ui.selectable_value(&mut self.tab, NavTab::Viewer, "📺 Visor Remoto (Activo)");
                 }
                 ui.separator();
+                ui.selectable_value(&mut self.tab, NavTab::AiCopilot, "🤖 Copiloto IA");
+                ui.selectable_value(&mut self.tab, NavTab::Rmm, "🛠 RMM y Terminal");
+                ui.selectable_value(&mut self.tab, NavTab::Calendar, "📅 Calendario y CSV");
+                ui.selectable_value(&mut self.tab, NavTab::UsersMfa, "👥 Usuarios y MFA");
+                ui.separator();
                 ui.selectable_value(&mut self.tab, NavTab::Settings, "⚙ Configuración");
 
                 if matches!(self.tab, NavTab::Agenda | NavTab::Devices) {
@@ -1272,6 +1619,10 @@ impl eframe::App for AgentDeskApp {
                 NavTab::Agenda => self.ui_agenda(ui),
                 NavTab::Devices => self.ui_devices(ui),
                 NavTab::Tickets => self.ui_tickets(ui),
+                NavTab::AiCopilot => self.ui_ai_copilot(ui, ctx),
+                NavTab::Rmm => self.ui_rmm_terminal(ui),
+                NavTab::Calendar => self.ui_calendar_reports(ui),
+                NavTab::UsersMfa => self.ui_users_mfa(ui),
                 NavTab::Viewer => self.ui_viewer(ui),
                 NavTab::Settings => self.ui_settings(ui, ctx),
             });
@@ -1779,13 +2130,44 @@ impl AgentDeskApp {
         let mut send_chat: Option<String> = None;
 
         if let Some(v) = &mut self.viewer {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.colored_label(p.ok, "🔒 E2EE Noise_XX");
                 ui.strong(&v.label);
-                ui.label(format!("FPS: {:.1}", v.fps));
-                ui.label(format!("RTT: {} ms", v.rtt_ms));
-                ui.label(format!("BW: {:.1} KB/s", v.kbps));
-                ui.label(if v.allow_control { "Modo: Control" } else { "Modo: Solo Ver" });
+                ui.label(format!("FPS: {:.1} · RTT: {} ms · {:.1} KB/s", v.fps, v.rtt_ms, v.kbps));
+                if !v.monitors.is_empty() {
+                    let cur_label = v
+                        .monitors
+                        .get(v.active_monitor)
+                        .map(|m| format!("Mon {} ({}x{})", m.index + 1, m.width, m.height))
+                        .unwrap_or_else(|| "Monitor 1".into());
+                    egui::ComboBox::from_id_salt("mon_pick")
+                        .selected_text(cur_label)
+                        .show_ui(ui, |ui| {
+                            let mons = v.monitors.clone();
+                            for m in mons {
+                                let txt = format!("Mon {} ({}x{})", m.index + 1, m.width, m.height);
+                                if ui.selectable_value(&mut v.active_monitor, m.index, txt).clicked() {
+                                    let _ = v.out_tx.send(DataPacket::Control(ControlMessage::SelectMonitor {
+                                        index: m.index,
+                                    }));
+                                }
+                            }
+                        });
+                }
+                if v.allow_control {
+                    for combo in ["Win", "Alt+Tab", "Ctrl+Shift+Esc"] {
+                        if ui.button(combo).clicked() {
+                            let _ = v.out_tx.send(DataPacket::Control(ControlMessage::SpecialKey {
+                                combo: combo.into(),
+                            }));
+                        }
+                    }
+                    if ui.button("📋 Enviar Portapapeles").clicked() {
+                        if let Some(clip) = read_clipboard_text() {
+                            let _ = v.out_tx.send(DataPacket::Control(ControlMessage::ClipboardText { text: clip }));
+                        }
+                    }
+                }
                 if ui.add(egui::Slider::new(&mut v.jpeg_quality, 30..=95).text("Calidad")).changed() {
                     send_quality = true;
                 }
@@ -1838,6 +2220,32 @@ impl AgentDeskApp {
                             if i.pointer.button_released(egui::PointerButton::Secondary) {
                                 let _ = v.out_tx.send(DataPacket::Input(InputEvent::MouseButton { button: MouseBtn::Right, pressed: false }));
                             }
+                            let wheel_y = i.raw_scroll_delta.y;
+                            if wheel_y.abs() > 0.1 {
+                                let _ = v.out_tx.send(DataPacket::Input(InputEvent::MouseWheel {
+                                    delta_y: (wheel_y as i32) * 3,
+                                }));
+                            }
+                            for ev in &i.events {
+                                match ev {
+                                    egui::Event::Text(txt) => {
+                                        for ch in txt.chars() {
+                                            if !ch.is_control() {
+                                                let _ = v.out_tx.send(DataPacket::Input(InputEvent::UnicodeChar { ch }));
+                                            }
+                                        }
+                                    }
+                                    egui::Event::Key { key, pressed, repeat, .. } if !repeat => {
+                                        if let Some(vk) = egui_key_to_vk(*key) {
+                                            // Printable alphanumeric/space already handled by Event::Text on press
+                                            if vk < 0x30 || !*pressed {
+                                                let _ = v.out_tx.send(DataPacket::Input(InputEvent::Key { vk, pressed: *pressed }));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         });
                     }
                 } else {
@@ -1847,7 +2255,7 @@ impl AgentDeskApp {
                 }
 
                 cols[1].heading("Chat de sesión");
-                egui::ScrollArea::vertical().max_height(260.0).show(&mut cols[1], |ui| {
+                egui::ScrollArea::vertical().max_height(200.0).show(&mut cols[1], |ui| {
                     for line in &v.chat_log {
                         ui.label(line);
                     }
@@ -1860,6 +2268,57 @@ impl AgentDeskApp {
                         v.chat_input.clear();
                     }
                 });
+
+                cols[1].separator();
+                cols[1].heading("Transferencia de archivos E2EE (SHA-256)");
+                cols[1].label(RichText::new("Ruta local del archivo a enviar al destino:").small().color(p.text_muted));
+                cols[1].text_edit_singleline(&mut v.file_path_input);
+                if cols[1].button("📤 Enviar archivo").clicked() && !v.file_path_input.trim().is_empty() {
+                    let path = PathBuf::from(v.file_path_input.trim().trim_matches('"'));
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            let transfer_id = Uuid::new_v4();
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "archivo.bin".into());
+                            let sha256 = hex::encode(Sha256::digest(&bytes));
+                            let _ = v.out_tx.send(DataPacket::Control(ControlMessage::FileOffer {
+                                transfer_id,
+                                filename: filename.clone(),
+                                size_bytes: bytes.len() as u64,
+                                sha256,
+                            }));
+                            let chunk_size = 64 * 1024;
+                            let total = bytes.len();
+                            for (i, chunk) in bytes.chunks(chunk_size).enumerate() {
+                                let offset = (i * chunk_size) as u64;
+                                let eof = (i + 1) * chunk_size >= total;
+                                let _ = v.out_tx.send(DataPacket::Control(ControlMessage::FileChunk {
+                                    transfer_id,
+                                    offset,
+                                    data: chunk.to_vec(),
+                                    eof,
+                                }));
+                            }
+                            if bytes.is_empty() {
+                                let _ = v.out_tx.send(DataPacket::Control(ControlMessage::FileChunk {
+                                    transfer_id,
+                                    offset: 0,
+                                    data: Vec::new(),
+                                    eof: true,
+                                }));
+                            }
+                            v.file_status = format!("Enviando {filename} ({total} bytes)...");
+                        }
+                        Err(e) => {
+                            v.file_status = format!("Error leyendo archivo: {e}");
+                        }
+                    }
+                }
+                if !v.file_status.is_empty() {
+                    cols[1].label(&v.file_status);
+                }
             });
 
             if let Some(txt) = send_chat {
