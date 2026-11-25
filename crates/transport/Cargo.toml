@@ -1,0 +1,13 @@
+[package]
+name = "agentdesk-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentdesk-identity.workspace = true
+agentdesk-protocol.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true

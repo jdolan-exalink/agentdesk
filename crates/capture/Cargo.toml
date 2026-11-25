@@ -1,0 +1,15 @@
+[package]
+name = "agentdesk-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentdesk-protocol.workspace = true
+image.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

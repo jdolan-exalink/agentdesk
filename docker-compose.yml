@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: agentdesk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agentdesk
+      POSTGRES_PASSWORD: agentdesk_dev_pass
+      POSTGRES_DB: agentdesk
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - agentdesk_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentdesk -d agentdesk"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  agentdesk_pgdata:

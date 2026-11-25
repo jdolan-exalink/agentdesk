@@ -1,0 +1,16 @@
+/target/
+.env
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.bak
+*.dpapi
+desktop_config.json
+host_config.json
+server_config.json
+agentdesk-server.json
+agentdesk-desktop.json
+agentdesk-host.json
+.DS_Store
+Thumbs.db
