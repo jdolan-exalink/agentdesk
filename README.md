@@ -44,6 +44,18 @@
   - **Dracula Oscuro**: paleta completa `#282A36` / `#BD93F9` / `#8BE9FD` / `#50FA7B`.
 - **Consola técnica integrada:** pestañas de **Conexión Rápida**, **Clientes Agendados**, **Equipos con Agente**, **Cola de Soporte**, **Visor Remoto** (canvas hardware + FPS/RTT/BW + control de mouse + ajuste de calidad JPEG + chat) y **Configuración** (URL del servidor persistente, prueba de conexión `/health/ready`, presets LAN/Localhost y selector de tema).
 
+### 3b. Novedades estilo TeamViewer (Desktop + Web `/app`)
+
+- **Histórico de conexiones** con reconexión rápida: dentro de 1 hora se reconecta con un token efímero emitido por el servidor (nunca se guardan contraseñas en disco); pasada la hora vuelve a pedir contraseña.
+- **Barra de búsqueda global** (ID, equipo, agenda, grupos, historial) con conexión en 1 clic.
+- **Contraseña personal fija** (además o en lugar de la aleatoria) para acceso desatendido.
+- **Icono de systray propio del cliente** (cuadrado verde-teal con flechas ⇄, distinto al del servidor), minimiza a bandeja al cerrar, inicio con Windows y servicio `AgentDeskHost` (antes del login).
+- **Acciones remotas**: reiniciar PC con auto-reconexión, bloquear, cerrar sesión / cambiar usuario de Windows; si la conexión se corta se pregunta si querés auto-reconectar.
+- **Grupos de equipos** compartibles con otros usuarios (`read_only`, `read_write`, `full_control`) y alta de equipos por **ID de conexión o email** de usuario registrado.
+- **Menú de usuario arriba a la derecha** (estilo OpenVMS): login, tema OpenVMS Claro / Dracula Oscuro, cambio de contraseña y cerrar sesión.
+- **Recursos del PC** en vivo: CPU, RAM, discos y GPU con estados y consumo, también dentro del visor remoto.
+- Investigación de UX: [research/teamviewer/web-ux-and-dashboard.md](research/teamviewer/web-ux-and-dashboard.md).
+
 ### 4. Agente Host Desatendido y QuickSupport (`agentdesk-host.exe`)
 - **Captura DXGI Desktop Duplication** (`IDXGIOutputDuplication` con soporte `OpenInputDesktop`/`SetThreadDesktop`) + fallback automático **GDI `BitBlt`**, inyección `SendInput` y telemetría de RAM privada (`GetProcessMemoryInfo`).
 - Modo **Host desatendido**: identidad `Ed25519` cifrada con Windows **DPAPI**, configuración persistente (`host_config.json`, `--configure-server`, `--show-config`), reconexión automática cada `5s` y soporte nativo como **Servicio Windows (`AgentDeskHost`)** vía `--service`.

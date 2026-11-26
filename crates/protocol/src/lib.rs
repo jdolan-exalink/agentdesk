@@ -72,6 +72,10 @@ pub enum ControlMessage {
     FileOffer { transfer_id: Uuid, filename: String, size_bytes: u64, sha256: String },
     FileChunk { transfer_id: Uuid, offset: u64, data: Vec<u8>, eof: bool },
     FileAck { transfer_id: Uuid, ok: bool, message: String },
+    RequestHardwareResources,
+    HardwareResourcesSnapshot { resources_json: String },
+    SessionAction { action: String, target_user: Option<String>, delay_secs: Option<u64> },
+    RebootPending { delay_secs: u64, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +264,10 @@ pub struct QuickRegisterRequest {
     pub screen_height: i32,
     pub private_mem_mb: f64,
     pub access_password: String,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub personal_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,9 +285,19 @@ pub struct RotatePasswordRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPersonalPasswordRequest {
+    pub device_id: Uuid,
+    #[serde(default)]
+    pub personal_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectConnectRequest {
     pub connection_id: String,
+    #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub reconnect_token: Option<String>,
     pub caller_name: Option<String>,
     pub allow_control: bool,
     pub allow_clipboard: bool,
@@ -293,6 +311,10 @@ pub struct DirectConnectResponse {
     pub target_hostname: String,
     pub target_connection_id: String,
     pub device_pubkey: String,
+    #[serde(default)]
+    pub reconnect_token: Option<String>,
+    #[serde(default)]
+    pub reconnect_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +341,10 @@ pub struct DeviceDto {
     pub private_mem_mb: f64,
     pub status: String,
     pub last_heartbeat_at: DateTime<Utc>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub has_personal_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +352,8 @@ pub struct AddressBookEntryDto {
     pub id: Uuid,
     pub organization_id: Uuid,
     pub device_id: Option<Uuid>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
     pub alias: String,
     pub client_company: String,
     pub contact_name: String,
@@ -346,6 +374,8 @@ pub struct AddressBookEntryDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertAddressBookRequest {
     pub device_id: Option<Uuid>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
     pub alias: String,
     pub client_company: String,
     pub contact_name: String,
@@ -636,6 +666,70 @@ pub struct DocPageDto {
     pub title: String,
     pub body_markdown: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceGroupShareDto {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub user_id: Uuid,
+    pub user_email: String,
+    pub user_display_name: String,
+    pub permission: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceGroupDto {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub owner_user_id: Uuid,
+    pub owner_email: String,
+    pub my_permission: String,
+    pub device_count: i64,
+    pub shares: Vec<DeviceGroupShareDto>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDeviceGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareDeviceGroupRequest {
+    pub user_email: String,
+    pub permission: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignDeviceRequest {
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
+    #[serde(default)]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignDeviceResponse {
+    pub device: DeviceDto,
+    pub address_book_entry: Option<AddressBookEntryDto>,
 }
 
 #[cfg(test)]

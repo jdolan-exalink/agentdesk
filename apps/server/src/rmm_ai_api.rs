@@ -1277,3 +1277,469 @@ pub async fn upsert_doc(
         updated_at: row.get("updated_at"),
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Device Groups, Sharing & Registration by Connection ID or User Email
+// ---------------------------------------------------------------------------
+
+async fn fetch_group_shares(
+    pool: &sqlx::PgPool,
+    group_id: Uuid,
+) -> Result<Vec<agentdesk_protocol::DeviceGroupShareDto>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT s.id, s.group_id, s.user_id, s.permission, s.created_at, u.email, u.display_name
+         FROM device_group_shares s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.group_id = $1
+         ORDER BY u.email ASC",
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| agentdesk_protocol::DeviceGroupShareDto {
+            id: r.get("id"),
+            group_id: r.get("group_id"),
+            user_id: r.get("user_id"),
+            user_email: r.get("email"),
+            user_display_name: r.get("display_name"),
+            permission: r.get("permission"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn list_groups(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<Vec<agentdesk_protocol::DeviceGroupDto>>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT g.id, g.organization_id, g.name, g.description, g.owner_user_id, g.created_at,
+                u.email AS owner_email, s.permission AS share_perm,
+                (SELECT COUNT(*) FROM address_book_entries a WHERE a.group_id = g.id) AS device_count
+         FROM device_groups g
+         JOIN users u ON u.id = g.owner_user_id
+         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+         WHERE g.organization_id = $1
+           AND (g.owner_user_id = $2 OR s.user_id IS NOT NULL OR $3 IN ('admin', 'org_admin'))
+         ORDER BY g.name ASC",
+    )
+    .bind(auth.user.organization_id)
+    .bind(auth.user.id)
+    .bind(&auth.user.role)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let gid: Uuid = r.get("id");
+        let owner_id: Uuid = r.get("owner_user_id");
+        let share_perm: Option<String> = r.get("share_perm");
+        let my_permission = if owner_id == auth.user.id || crate::state::is_admin_role(&auth.user.role) {
+            "full_control".to_string()
+        } else {
+            share_perm.unwrap_or_else(|| "read_only".to_string())
+        };
+        let shares = fetch_group_shares(&state.pool, gid).await?;
+        out.push(agentdesk_protocol::DeviceGroupDto {
+            id: gid,
+            organization_id: r.get("organization_id"),
+            name: r.get("name"),
+            description: r.get("description"),
+            owner_user_id: owner_id,
+            owner_email: r.get("owner_email"),
+            my_permission,
+            device_count: r.get("device_count"),
+            shares,
+            created_at: r.get("created_at"),
+        });
+    }
+    Ok(Json(out))
+}
+
+pub async fn create_group(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(req): Json<agentdesk_protocol::CreateDeviceGroupRequest>,
+) -> Result<Json<agentdesk_protocol::DeviceGroupDto>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("El nombre del grupo es obligatorio"));
+    }
+    let id = Uuid::new_v4();
+    let row = sqlx::query(
+        "INSERT INTO device_groups (id, organization_id, name, description, owner_user_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING created_at",
+    )
+    .bind(id)
+    .bind(auth.user.organization_id)
+    .bind(name)
+    .bind(req.description.trim())
+    .bind(auth.user.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            ApiError::conflict("Ya existe un grupo con ese nombre")
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "group.created",
+        "device_group",
+        &id.to_string(),
+        "success",
+        json!({ "name": name }),
+    )
+    .await;
+
+    Ok(Json(agentdesk_protocol::DeviceGroupDto {
+        id,
+        organization_id: auth.user.organization_id,
+        name: name.to_string(),
+        description: req.description.trim().to_string(),
+        owner_user_id: auth.user.id,
+        owner_email: auth.user.email.clone(),
+        my_permission: "full_control".to_string(),
+        device_count: 0,
+        shares: vec![],
+        created_at: row.get("created_at"),
+    }))
+}
+
+pub async fn delete_group(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = sqlx::query(
+        "SELECT owner_user_id FROM device_groups WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(id)
+    .bind(auth.user.organization_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
+
+    let owner_id: Uuid = row.get("owner_user_id");
+    if owner_id != auth.user.id && !crate::state::is_admin_role(&auth.user.role) {
+        return Err(ApiError::unauthorized("solo el propietario o admin puede eliminar el grupo"));
+    }
+
+    sqlx::query("DELETE FROM device_groups WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn share_group(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(group_id): Path<Uuid>,
+    Json(req): Json<agentdesk_protocol::ShareDeviceGroupRequest>,
+) -> Result<Json<agentdesk_protocol::DeviceGroupShareDto>, ApiError> {
+    let perm = req.permission.trim();
+    if !matches!(perm, "read_only" | "read_write" | "full_control") {
+        return Err(ApiError::bad_request(
+            "permiso inválido: use read_only, read_write o full_control",
+        ));
+    }
+
+    let grp = sqlx::query(
+        "SELECT g.owner_user_id, s.permission AS caller_perm
+         FROM device_groups g
+         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+         WHERE g.id = $1 AND g.organization_id = $3",
+    )
+    .bind(group_id)
+    .bind(auth.user.id)
+    .bind(auth.user.organization_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
+
+    let owner_id: Uuid = grp.get("owner_user_id");
+    let caller_perm: Option<String> = grp.get("caller_perm");
+    let allowed = owner_id == auth.user.id
+        || crate::state::is_admin_role(&auth.user.role)
+        || caller_perm.as_deref() == Some("full_control");
+    if !allowed {
+        return Err(ApiError::unauthorized("sin permisos para compartir este grupo"));
+    }
+
+    let target = sqlx::query(
+        "SELECT id, email, display_name FROM users WHERE organization_id = $1 AND LOWER(email) = LOWER($2)",
+    )
+    .bind(auth.user.organization_id)
+    .bind(req.user_email.trim())
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("usuario destino no encontrado en la organización"))?;
+
+    let target_id: Uuid = target.get("id");
+    let share_id = Uuid::new_v4();
+    let row = sqlx::query(
+        "INSERT INTO device_group_shares (id, group_id, user_id, permission)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (group_id, user_id) DO UPDATE SET permission = EXCLUDED.permission
+         RETURNING id, created_at",
+    )
+    .bind(share_id)
+    .bind(group_id)
+    .bind(target_id)
+    .bind(perm)
+    .fetch_one(&state.pool)
+    .await?;
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "group.shared",
+        "device_group",
+        &group_id.to_string(),
+        "success",
+        json!({ "target_email": target.get::<String, _>("email"), "permission": perm }),
+    )
+    .await;
+
+    Ok(Json(agentdesk_protocol::DeviceGroupShareDto {
+        id: row.get("id"),
+        group_id,
+        user_id: target_id,
+        user_email: target.get("email"),
+        user_display_name: target.get("display_name"),
+        permission: perm.to_string(),
+        created_at: row.get("created_at"),
+    }))
+}
+
+pub async fn unshare_group(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((group_id, target_user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let grp = sqlx::query(
+        "SELECT g.owner_user_id, s.permission AS caller_perm
+         FROM device_groups g
+         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+         WHERE g.id = $1 AND g.organization_id = $3",
+    )
+    .bind(group_id)
+    .bind(auth.user.id)
+    .bind(auth.user.organization_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
+
+    let owner_id: Uuid = grp.get("owner_user_id");
+    let caller_perm: Option<String> = grp.get("caller_perm");
+    let allowed = owner_id == auth.user.id
+        || crate::state::is_admin_role(&auth.user.role)
+        || caller_perm.as_deref() == Some("full_control");
+    if !allowed {
+        return Err(ApiError::unauthorized("sin permisos para modificar este grupo"));
+    }
+
+    sqlx::query("DELETE FROM device_group_shares WHERE group_id = $1 AND user_id = $2")
+        .bind(group_id)
+        .bind(target_user_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn assign_device(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(req): Json<agentdesk_protocol::AssignDeviceRequest>,
+) -> Result<Json<agentdesk_protocol::AssignDeviceResponse>, ApiError> {
+    let norm_code: String = req
+        .connection_id
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    if norm_code.is_empty() {
+        return Err(ApiError::bad_request("Debe indicar el ID de conexión del equipo"));
+    }
+
+    let dev_row = sqlx::query(
+        "SELECT id, organization_id, public_code, ed25519_pubkey, hostname, os_name, os_arch, agent_version,
+                kind, screen_width, screen_height, private_mem_mb, status, last_heartbeat_at, personal_password_hash, owner_user_id
+         FROM devices
+         WHERE organization_id = $1
+           AND regexp_replace(UPPER(public_code), '[^A-Z0-9]', '', 'g') = $2
+         LIMIT 1",
+    )
+    .bind(auth.user.organization_id)
+    .bind(&norm_code)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("No se encontró un equipo con ese ID en la organización"))?;
+
+    let device_id: Uuid = dev_row.get("id");
+    let mut owner_email_out: Option<String> = None;
+
+    if let Some(em) = req.owner_email.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let user_row = sqlx::query(
+            "SELECT id, email FROM users WHERE organization_id = $1 AND LOWER(email) = LOWER($2)",
+        )
+        .bind(auth.user.organization_id)
+        .bind(em)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Usuario con ese email no encontrado"))?;
+
+        let uid: Uuid = user_row.get("id");
+        sqlx::query("UPDATE devices SET owner_user_id = $2 WHERE id = $1")
+            .bind(device_id)
+            .bind(uid)
+            .execute(&state.pool)
+            .await?;
+        owner_email_out = Some(user_row.get("email"));
+    } else if let Some(uid) = dev_row.get::<Option<Uuid>, _>("owner_user_id") {
+        owner_email_out = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&state.pool)
+            .await?;
+    }
+
+    let mut entry_dto = None;
+    if req.group_id.is_some() || req.alias.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+        let gname = if let Some(gid) = req.group_id {
+            let gn: Option<String> = sqlx::query_scalar(
+                "SELECT g.name FROM device_groups g
+                 LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+                 WHERE g.id = $1 AND g.organization_id = $3
+                   AND (g.owner_user_id = $2 OR $4 IN ('admin', 'org_admin') OR s.permission IN ('read_write', 'full_control'))",
+            )
+            .bind(gid)
+            .bind(auth.user.id)
+            .bind(auth.user.organization_id)
+            .bind(&auth.user.role)
+            .fetch_optional(&state.pool)
+            .await?;
+            gn.ok_or_else(|| ApiError::unauthorized("Grupo no encontrado o sin permiso de escritura"))?
+        } else {
+            "General".to_string()
+        };
+
+        let hostname: String = dev_row.get("hostname");
+        let alias = req
+            .alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&hostname)
+            .to_string();
+        let notes = req.notes.as_deref().map(str::trim).unwrap_or("").to_string();
+
+        let eid = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO address_book_entries (id, organization_id, device_id, group_id, alias, client_company, contact_name, contact_email, group_name, is_favorite, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5, '', '', $6, $7, false, $8, $9)",
+        )
+        .bind(eid)
+        .bind(auth.user.organization_id)
+        .bind(device_id)
+        .bind(req.group_id)
+        .bind(&alias)
+        .bind(owner_email_out.as_deref().unwrap_or(""))
+        .bind(&gname)
+        .bind(&notes)
+        .bind(auth.user.id)
+        .execute(&state.pool)
+        .await?;
+
+        let ar = sqlx::query(
+            "SELECT a.id, a.organization_id, a.device_id, a.group_id, a.alias, a.client_company, a.contact_name,
+                    a.contact_email, a.group_name, a.is_favorite, a.notes, a.scheduled_next_at,
+                    a.created_at, a.updated_at,
+                    d.public_code AS device_public_code, d.hostname AS device_hostname,
+                    d.status AS device_status, d.os_name AS device_os, d.last_heartbeat_at AS device_last_heartbeat
+             FROM address_book_entries a
+             LEFT JOIN devices d ON d.id = a.device_id AND d.organization_id = a.organization_id
+             WHERE a.id = $1",
+        )
+        .bind(eid)
+        .fetch_one(&state.pool)
+        .await?;
+
+        entry_dto = Some(agentdesk_protocol::AddressBookEntryDto {
+            id: ar.get("id"),
+            organization_id: ar.get("organization_id"),
+            device_id: ar.get("device_id"),
+            group_id: ar.get("group_id"),
+            alias: ar.get("alias"),
+            client_company: ar.get("client_company"),
+            contact_name: ar.get("contact_name"),
+            contact_email: ar.get("contact_email"),
+            group_name: ar.get("group_name"),
+            is_favorite: ar.get("is_favorite"),
+            notes: ar.get("notes"),
+            scheduled_next_at: ar.get("scheduled_next_at"),
+            created_at: ar.get("created_at"),
+            updated_at: ar.get("updated_at"),
+            device_public_code: ar.get("device_public_code"),
+            device_hostname: ar.get("device_hostname"),
+            device_status: ar.get("device_status"),
+            device_os: ar.get("device_os"),
+            device_last_heartbeat: ar.get("device_last_heartbeat"),
+        });
+    }
+
+    let device = agentdesk_protocol::DeviceDto {
+        id: device_id,
+        organization_id: dev_row.get("organization_id"),
+        public_code: dev_row.get("public_code"),
+        ed25519_pubkey: dev_row.get("ed25519_pubkey"),
+        hostname: dev_row.get("hostname"),
+        os_name: dev_row.get("os_name"),
+        os_arch: dev_row.get("os_arch"),
+        agent_version: dev_row.get("agent_version"),
+        kind: dev_row.get("kind"),
+        screen_width: dev_row.get("screen_width"),
+        screen_height: dev_row.get("screen_height"),
+        private_mem_mb: dev_row.get("private_mem_mb"),
+        status: dev_row.get("status"),
+        last_heartbeat_at: dev_row.get("last_heartbeat_at"),
+        owner_email: owner_email_out,
+        has_personal_password: dev_row
+            .get::<Option<String>, _>("personal_password_hash")
+            .is_some(),
+    };
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "device.assigned",
+        "device",
+        &device_id.to_string(),
+        "success",
+        json!({ "connection_id": device.public_code, "owner_email": device.owner_email, "group_id": req.group_id }),
+    )
+    .await;
+
+    Ok(Json(agentdesk_protocol::AssignDeviceResponse {
+        device,
+        address_book_entry: entry_dto,
+    }))
+}

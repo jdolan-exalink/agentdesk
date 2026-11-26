@@ -294,3 +294,48 @@ pub async fn logout(
 pub async fn me(auth: AuthContext) -> Json<AuthUserInfo> {
     Json(auth.user)
 }
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(req): Json<agentdesk_protocol::ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cur = req.current_password.trim();
+    let next = req.new_password.trim();
+    if next.len() < 6 {
+        return Err(ApiError::bad_request("La nueva contraseña debe tener al menos 6 caracteres"));
+    }
+
+    let row = sqlx::query("SELECT password_hash FROM users WHERE id = $1")
+        .bind(auth.user.id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("usuario no encontrado"))?;
+
+    let stored_hash: String = row.get("password_hash");
+    if !verify_password(cur, &stored_hash).unwrap_or(false) {
+        return Err(ApiError::unauthorized("La contraseña actual es incorrecta"));
+    }
+
+    let new_hash = hash_password(next).map_err(|e| ApiError::internal(e.to_string()))?;
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(auth.user.id)
+        .bind(&new_hash)
+        .execute(&state.pool)
+        .await?;
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "auth.change_password",
+        "user",
+        &auth.user.id.to_string(),
+        "success",
+        json!({}),
+    )
+    .await;
+
+    Ok(Json(json!({ "ok": true })))
+}

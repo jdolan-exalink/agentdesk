@@ -166,3 +166,9 @@ pub async fn record_audit(
         tracing::warn!(error = %e, "failed to record audit event");
     }
 }
+
+/// Roles con privilegios de administración de la organización.
+pub fn is_admin_role(role: &str) -> bool {
+    matches!(role, "admin" | "org_admin")
+}
+

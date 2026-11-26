@@ -54,6 +54,16 @@ tr:hover td { background: rgba(59,130,246,.04); }
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .muted { color: var(--muted); }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.user-menu { position: relative; }
+.user-pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; font-size: 13px; font-weight: 600; }
+.user-avatar { width: 24px; height: 24px; border-radius: 999px; background: var(--primary); color: #fff; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
+.user-dropdown { display: none; position: absolute; right: 0; top: calc(100% + 6px); min-width: 240px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.35); z-index: 40; }
+.user-dropdown.open { display: block; }
+.dd-item { width: 100%; text-align: left; padding: 8px 10px; border: none; background: transparent; color: var(--text); border-radius: 6px; cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
+.dd-item:hover { background: var(--surface-2); }
+.dd-sep { height: 1px; background: var(--border); margin: 6px 0; }
+.modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); align-items: center; justify-content: center; z-index: 60; }
+.modal-backdrop.open { display: flex; }
 "#;
 
 fn shell(title: &str, body: &str) -> Html<String> {
@@ -315,6 +325,7 @@ pub async fn app_dashboard_page() -> Html<String> {
   <aside class="sidebar">
     <div class="brand" style="margin-bottom:12px;">AgentDesk</div>
     <div class="nav-item active" data-tab="agenda">Clientes Agendados</div>
+    <div class="nav-item" data-tab="groups">Grupos y Compartición</div>
     <div class="nav-item" data-tab="devices">Equipos con Agente</div>
     <div class="nav-item" data-tab="tickets">Cola de Soporte</div>
     <div class="nav-item" data-tab="audit">Auditoría</div>
@@ -326,13 +337,29 @@ pub async fn app_dashboard_page() -> Html<String> {
   <div>
     <header class="topbar">
       <div class="row" style="flex:1;max-width:420px;">
-        <input id="global-search" placeholder="Buscar equipo, cliente o ticket (Ctrl+K)..." />
+        <input id="global-search" placeholder="Buscar equipo, ID, grupo o ticket (Ctrl+K)..." />
       </div>
       <div class="row">
         <span id="org-badge" class="badge">...</span>
         <span id="sse-badge" class="badge ok">En vivo</span>
-        <button class="btn" id="theme-btn">Tema</button>
-        <button class="btn" id="logout-btn">Salir</button>
+        <div class="user-menu">
+          <button class="user-pill" id="user-menu-btn" type="button">
+            <span class="user-avatar" id="user-avatar">U</span>
+            <span id="user-label">Usuario</span>
+            <span class="muted">▾</span>
+          </button>
+          <div class="user-dropdown" id="user-dropdown">
+            <div style="padding:6px 10px;">
+              <div id="dd-name" style="font-weight:700;font-size:13px;">-</div>
+              <div id="dd-email" class="muted" style="font-size:12px;">-</div>
+            </div>
+            <div class="dd-sep"></div>
+            <button class="dd-item" id="theme-btn" type="button"><span>Tema</span><span id="theme-label" class="badge">Dracula Oscuro</span></button>
+            <button class="dd-item" id="open-pw-btn" type="button"><span>Cambiar contraseña</span><span>🔑</span></button>
+            <div class="dd-sep"></div>
+            <button class="dd-item" id="logout-btn" type="button" style="color:var(--err);"><span>Cerrar sesión</span><span>⎋</span></button>
+          </div>
+        </div>
       </div>
     </header>
     <main class="content">
@@ -353,7 +380,7 @@ pub async fn app_dashboard_page() -> Html<String> {
             <div class="field"><label>Alias / Equipo</label><input id="ag-alias" required placeholder="PC Caja 01"/></div>
             <div class="field"><label>Empresa cliente</label><input id="ag-company" placeholder="Cliente Norte S.A."/></div>
             <div class="field"><label>Contacto</label><input id="ag-contact" placeholder="María Gómez"/></div>
-            <div class="field"><label>Grupo</label><input id="ag-group" value="General"/></div>
+            <div class="field"><label>Grupo compartido</label><select id="ag-group-id"><option value="">General (sin grupo)</option></select></div>
             <div class="field"><label>Vincular equipo (opcional)</label><select id="ag-device"><option value="">Sin vincular</option></select></div>
             <div class="field"><label>Próxima cita (opcional)</label><input id="ag-sched" type="datetime-local"/></div>
           </div>
@@ -363,13 +390,39 @@ pub async fn app_dashboard_page() -> Html<String> {
         <table><thead><tr><th>Fav</th><th>Alias</th><th>Empresa / Contacto</th><th>Grupo</th><th>Equipo vinculado</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="agenda-body"></tbody></table>
       </section>
 
+      <section id="tab-groups" class="card" style="display:none;">
+        <div class="row" style="justify-content:space-between;margin-bottom:12px;">
+          <h2 style="margin:0;">Grupos de Equipos y Compartición</h2>
+        </div>
+        <form id="group-form" class="card" style="margin-bottom:14px;background:var(--surface-2);">
+          <div class="grid grid-3">
+            <div class="field"><label>Nombre del grupo</label><input id="grp-name" required placeholder="Sucursal Centro / VIP"/></div>
+            <div class="field"><label>Descripción</label><input id="grp-desc" placeholder="Servidores y cajas"/></div>
+            <div class="field" style="display:flex;align-items:flex-end;"><button class="btn primary" type="submit">+ Crear grupo</button></div>
+          </div>
+        </form>
+        <table><thead><tr><th>Grupo</th><th>Propietario</th><th>Tu permiso</th><th>Equipos</th><th>Compartido con</th><th>Compartir / Acciones</th></tr></thead><tbody id="groups-body"></tbody></table>
+      </section>
+
       <section id="tab-devices" class="card" style="display:none;">
         <div class="row" style="justify-content:space-between;margin-bottom:12px;">
-          <h2 style="margin:0;">Equipos con Agente (Host / QuickSupport)</h2>
+          <h2 style="margin:0;">Equipos con Agente (Host / Desktop / QuickSupport)</h2>
           <button class="btn primary" id="new-enroll-btn">+ Generar token de enrolamiento</button>
         </div>
+        <form id="assign-form" class="card" style="margin-bottom:12px;background:var(--surface-2);">
+          <div class="grid grid-4">
+            <div class="field"><label>ID de Conexión (9 dígitos)</label><input id="as-code" required placeholder="123 456 789"/></div>
+            <div class="field"><label>Email usuario registrado (opcional)</label><input id="as-email" type="email" placeholder="tecnico@empresa.com"/></div>
+            <div class="field"><label>Grupo (opcional)</label><select id="as-group"><option value="">Sin grupo</option></select></div>
+            <div class="field"><label>Alias agenda (opcional)</label><input id="as-alias" placeholder="PC Recepción"/></div>
+          </div>
+          <div class="row">
+            <button class="btn primary" type="submit">Registrar / Asignar equipo</button>
+            <span id="as-msg" class="muted"></span>
+          </div>
+        </form>
         <div id="enroll-out" class="mono card" style="display:none;margin-bottom:12px;background:var(--surface-2);"></div>
-        <table><thead><tr><th>Código</th><th>Hostname</th><th>Tipo</th><th>SO / Res</th><th>RAM</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="devices-body"></tbody></table>
+        <table><thead><tr><th>Código</th><th>Hostname</th><th>Tipo</th><th>Propietario</th><th>SO / Res</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="devices-body"></tbody></table>
       </section>
 
       <section id="tab-tickets" class="card" style="display:none;">
@@ -384,15 +437,45 @@ pub async fn app_dashboard_page() -> Html<String> {
     </main>
   </div>
 </div>
+<div id="pw-modal" class="modal-backdrop">
+  <div class="card" style="width:100%;max-width:400px;">
+    <h3 style="margin-top:0;">Cambiar contraseña</h3>
+    <form id="pw-form">
+      <div class="field"><label>Contraseña actual</label><input id="pw-cur" type="password" required/></div>
+      <div class="field"><label>Nueva contraseña (mín. 6)</label><input id="pw-new" type="password" required minlength="6"/></div>
+      <div id="pw-err" style="color:var(--err);margin-bottom:8px;"></div>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="btn" type="button" id="close-pw-btn">Cancelar</button>
+        <button class="btn primary" type="submit">Guardar</button>
+      </div>
+    </form>
+  </div>
+</div>
 <script>
-let state={devices:[],agenda:[],tickets:[],sessions:[],audit:[]};
+let state={devices:[],agenda:[],groups:[],tickets:[],sessions:[],audit:[]};
 document.addEventListener('keydown',(e)=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();document.getElementById('global-search').focus();}});
-document.getElementById('theme-btn').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'':'light';};
+const dd=document.getElementById('user-dropdown');
+document.getElementById('user-menu-btn').onclick=(e)=>{e.stopPropagation();dd.classList.toggle('open');};
+document.addEventListener('click',()=>dd.classList.remove('open'));
+document.getElementById('theme-btn').onclick=()=>{
+  const isLight=document.documentElement.dataset.theme==='light';
+  document.documentElement.dataset.theme=isLight?'':'light';
+  document.getElementById('theme-label').textContent=isLight?'Dracula Oscuro':'OpenVMS Claro';
+};
 document.getElementById('logout-btn').onclick=async()=>{await fetch('/api/v1/auth/logout',{method:'POST'});location.href='/login';};
+document.getElementById('open-pw-btn').onclick=()=>{dd.classList.remove('open');document.getElementById('pw-modal').classList.add('open');};
+document.getElementById('close-pw-btn').onclick=()=>{document.getElementById('pw-modal').classList.remove('open');};
+document.getElementById('pw-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  const res=await fetch('/api/v1/auth/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:document.getElementById('pw-cur').value,new_password:document.getElementById('pw-new').value})});
+  const d=await res.json();
+  if(!res.ok){document.getElementById('pw-err').textContent=d.error||'Error';return;}
+  document.getElementById('pw-modal').classList.remove('open');e.target.reset();
+};
 document.querySelectorAll('.nav-item[data-tab]').forEach(el=>el.onclick=()=>{
   document.querySelectorAll('.nav-item[data-tab]').forEach(n=>n.classList.remove('active'));
   el.classList.add('active');
-  ['agenda','devices','tickets','audit'].forEach(t=>document.getElementById('tab-'+t).style.display=(t===el.dataset.tab?'block':'none'));
+  ['agenda','groups','devices','tickets','audit'].forEach(t=>document.getElementById('tab-'+t).style.display=(t===el.dataset.tab?'block':'none'));
 });
 document.getElementById('toggle-add-agenda').onclick=()=>{const f=document.getElementById('agenda-form');f.style.display=f.style.display==='none'?'block':'none';};
 
@@ -400,11 +483,15 @@ async function api(url,opts){const r=await fetch(url,opts);if(r.status===401){lo
 
 async function loadAll(){
   const me=await api('/api/v1/auth/me');
-  document.getElementById('org-badge').textContent=me.organization_name+' · '+me.display_name;
-  const [devices,agenda,tickets,sessions,audit]=await Promise.all([
-    api('/api/v1/devices'),api('/api/v1/address-book'),api('/api/v1/tickets'),api('/api/v1/sessions'),api('/api/v1/audit')
+  document.getElementById('org-badge').textContent=me.organization_name;
+  document.getElementById('user-label').textContent=me.display_name;
+  document.getElementById('dd-name').textContent=me.display_name+' ('+me.role+')';
+  document.getElementById('dd-email').textContent=me.email;
+  document.getElementById('user-avatar').textContent=(me.display_name||'U').slice(0,2).toUpperCase();
+  const [devices,agenda,groups,tickets,sessions,audit]=await Promise.all([
+    api('/api/v1/devices'),api('/api/v1/address-book'),api('/api/v1/groups'),api('/api/v1/tickets'),api('/api/v1/sessions'),api('/api/v1/audit')
   ]);
-  state={devices,agenda,tickets,sessions,audit};
+  state={devices,agenda,groups,tickets,sessions,audit};
   render();
 }
 
@@ -417,6 +504,9 @@ function render(){
 
   const sel=document.getElementById('ag-device');
   sel.innerHTML='<option value="">Sin vincular</option>'+state.devices.map(d=>`<option value="${d.id}">${d.hostname} (${d.public_code})</option>`).join('');
+  const gOpts='<option value="">General (sin grupo)</option>'+state.groups.map(g=>`<option value="${g.id}">${g.name}</option>`).join('');
+  document.getElementById('ag-group-id').innerHTML=gOpts;
+  document.getElementById('as-group').innerHTML=gOpts;
 
   document.getElementById('agenda-body').innerHTML=state.agenda.filter(a=>!q||JSON.stringify(a).toLowerCase().includes(q)).map(a=>`
     <tr>
@@ -432,13 +522,30 @@ function render(){
       </td>
     </tr>`).join('');
 
+  document.getElementById('groups-body').innerHTML=state.groups.filter(g=>!q||JSON.stringify(g).toLowerCase().includes(q)).map(g=>`
+    <tr>
+      <td><strong>${g.name}</strong><div class="muted">${g.description||''}</div></td>
+      <td class="mono">${g.owner_email}</td>
+      <td><span class="badge">${g.my_permission}</span></td>
+      <td>${g.device_count}</td>
+      <td>${(g.shares||[]).map(s=>`<div class="badge" style="margin:2px;">${s.user_email} · ${s.permission} <a href="javascript:void(0)" onclick="unshareGroup('${g.id}','${s.user_id}');return false;">×</a></div>`).join('')||'<span class="muted">Privado</span>'}</td>
+      <td>
+        <div class="row">
+          <input id="sh-em-${g.id}" placeholder="email@empresa.com" style="width:150px;"/>
+          <select id="sh-perm-${g.id}" style="width:120px;"><option value="read_only">read_only</option><option value="read_write">read_write</option><option value="full_control">full_control</option></select>
+          <button class="btn primary" onclick="shareGroup('${g.id}')">Compartir</button>
+          <button class="btn danger" onclick="delGroup('${g.id}')">Eliminar</button>
+        </div>
+      </td>
+    </tr>`).join('');
+
   document.getElementById('devices-body').innerHTML=state.devices.filter(d=>!q||JSON.stringify(d).toLowerCase().includes(q)).map(d=>`
     <tr>
       <td class="mono">${d.public_code}</td>
       <td><strong>${d.hostname}</strong></td>
-      <td><span class="badge">${d.kind}</span></td>
+      <td><span class="badge">${d.kind}</span>${d.has_personal_password?' <span class="badge ok">Pass fija</span>':''}</td>
+      <td class="mono">${d.owner_email||'<span class="muted">Sin asignar</span>'}</td>
       <td>${d.os_name} (${d.screen_width}x${d.screen_height})</td>
-      <td>${d.private_mem_mb.toFixed(1)} MB</td>
       <td><span class="badge ${d.status==='online'?'ok':'off'}">${d.status}</span></td>
       <td><a class="btn primary" href="agentdesk://connect/${d.id}">Conectar</a></td>
     </tr>`).join('');
@@ -465,15 +572,17 @@ document.getElementById('global-search').oninput=render;
 document.getElementById('agenda-form').onsubmit=async(e)=>{
   e.preventDefault();
   const sched=document.getElementById('ag-sched').value;
+  const gid=document.getElementById('ag-group-id').value||null;
   await api('/api/v1/address-book',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
       device_id: document.getElementById('ag-device').value||null,
+      group_id: gid,
       alias: document.getElementById('ag-alias').value,
       client_company: document.getElementById('ag-company').value,
       contact_name: document.getElementById('ag-contact').value,
       contact_email: '',
-      group_name: document.getElementById('ag-group').value,
+      group_name: 'General',
       is_favorite: true,
       notes: document.getElementById('ag-notes').value,
       scheduled_next_at: sched?new Date(sched).toISOString():null
@@ -481,6 +590,29 @@ document.getElementById('agenda-form').onsubmit=async(e)=>{
   });
   e.target.reset(); e.target.style.display='none'; loadAll();
 };
+document.getElementById('group-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  await api('/api/v1/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('grp-name').value,description:document.getElementById('grp-desc').value})});
+  e.target.reset(); loadAll();
+};
+document.getElementById('assign-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  const res=await fetch('/api/v1/devices/assign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    connection_id: document.getElementById('as-code').value,
+    owner_email: document.getElementById('as-email').value||null,
+    group_id: document.getElementById('as-group').value||null,
+    alias: document.getElementById('as-alias').value||null
+  })});
+  const d=await res.json();
+  document.getElementById('as-msg').textContent=res.ok?('Equipo '+d.device.hostname+' actualizado'):(d.error||'Error');
+  if(res.ok){e.target.reset();loadAll();}
+};
+async function shareGroup(id){
+  await api('/api/v1/groups/'+id+'/shares',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_email:document.getElementById('sh-em-'+id).value,permission:document.getElementById('sh-perm-'+id).value})});
+  loadAll();
+}
+async function unshareGroup(gid,uid){await api('/api/v1/groups/'+gid+'/shares/'+uid,{method:'DELETE'});loadAll();}
+async function delGroup(id){await api('/api/v1/groups/'+id,{method:'DELETE'});loadAll();}
 async function delAgenda(id){await api('/api/v1/address-book/'+id,{method:'DELETE'});loadAll();}
 async function claimTicket(id){await api('/api/v1/tickets/'+id+'/claim',{method:'POST'});loadAll();}
 async function closeTicket(id){await api('/api/v1/tickets/'+id+'/close',{method:'POST'});loadAll();}

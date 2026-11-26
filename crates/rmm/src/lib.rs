@@ -315,6 +315,186 @@ $events = Get-WinEvent -FilterHashtable @{ LogName = 'System','Application'; Lev
     }
 }
 
+pub fn collect_hardware_resources() -> serde_json::Value {
+    #[cfg(windows)]
+    {
+        let ps = r#"
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 Name, NumberOfCores, NumberOfLogicalProcessors, LoadPercentage, MaxClockSpeed
+$os = Get-CimInstance Win32_OperatingSystem | Select-Object CSName, Caption, TotalVisibleMemorySize, FreePhysicalMemory, LastBootUpTime
+$totalRamGb = if ($os.TotalVisibleMemorySize) { [math]::Round($os.TotalVisibleMemorySize / 1MB, 2) } else { 0 }
+$freeRamGb = if ($os.FreePhysicalMemory) { [math]::Round($os.FreePhysicalMemory / 1MB, 2) } else { 0 }
+$usedRamGb = [math]::Round([math]::Max(0, $totalRamGb - $freeRamGb), 2)
+$ramPct = if ($totalRamGb -gt 0) { [math]::Round(($usedRamGb / $totalRamGb) * 100.0, 1) } else { 0 }
+$uptimeHours = if ($os.LastBootUpTime) { [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1) } else { 0 }
+
+$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+  $tot = if ($_.Size) { [math]::Round($_.Size / 1GB, 1) } else { 0 }
+  $free = if ($_.FreeSpace) { [math]::Round($_.FreeSpace / 1GB, 1) } else { 0 }
+  $usedPct = if ($tot -gt 0) { [math]::Round((($tot - $free) / $tot) * 100.0, 1) } else { 0 }
+  $st = if ($usedPct -ge 92) { 'critical' } elseif ($usedPct -ge 80) { 'warn' } else { 'healthy' }
+  [ordered]@{
+    drive = $_.DeviceID
+    label = if ($_.VolumeName) { $_.VolumeName } else { 'Local Disk' }
+    total_gb = $tot
+    free_gb = $free
+    used_pct = $usedPct
+    status = $st
+  }
+}
+
+$gpuLoad = $null
+try {
+  if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    $nv = (nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | Select-Object -First 1)
+    if ($nv -match '^\s*(\d+)') { $gpuLoad = [double]$Matches[1] }
+  }
+  if ($null -eq $gpuLoad) {
+    $sum = (Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction Stop).CounterSamples | Measure-Object CookedValue -Sum | Select-Object -ExpandProperty Sum
+    if ($null -ne $sum) { $gpuLoad = [math]::Round([math]::Min(100, [double]$sum), 1) }
+  }
+} catch {}
+
+$gpus = Get-CimInstance Win32_VideoController | ForEach-Object {
+  $vramGb = if ($_.AdapterRAM -and $_.AdapterRAM -gt 0) { [math]::Round($_.AdapterRAM / 1GB, 2) } else { $null }
+  [ordered]@{
+    name = $_.Name
+    vram_gb = $vramGb
+    driver = $_.DriverVersion
+    status = $_.Status
+    load_pct = $gpuLoad
+  }
+}
+
+$users = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -First 25 | ForEach-Object {
+  [ordered]@{
+    name = $_.Name
+    full_name = if ($_.FullName) { $_.FullName } else { '' }
+    enabled = (-not $_.Disabled)
+  }
+}
+
+$sessions = @()
+try {
+  $qLines = quser 2>$null
+  if ($qLines) {
+    foreach ($line in ($qLines | Select-Object -Skip 1)) {
+      $clean = ($line -replace '^>', ' ').Trim()
+      if ($clean -match '^(\S+)\s+(?:(\S+)\s+)?(\d+)\s+(\S+)') {
+        $sessions += [ordered]@{
+          username = $Matches[1]
+          session_name = if ($Matches[2]) { $Matches[2] } else { '' }
+          id = $Matches[3]
+          state = $Matches[4]
+        }
+      }
+    }
+  }
+} catch {}
+
+[ordered]@{
+  hostname = $os.CSName
+  os_caption = $os.Caption
+  uptime_hours = $uptimeHours
+  collected_at = (Get-Date).ToUniversalTime().ToString('o')
+  cpu = [ordered]@{
+    name = $cpu.Name
+    cores = $cpu.NumberOfCores
+    logical_processors = $cpu.NumberOfLogicalProcessors
+    load_pct = if ($null -ne $cpu.LoadPercentage) { [double]$cpu.LoadPercentage } else { 0.0 }
+    max_clock_mhz = $cpu.MaxClockSpeed
+  }
+  ram = [ordered]@{
+    total_gb = $totalRamGb
+    used_gb = $usedRamGb
+    free_gb = $freeRamGb
+    load_pct = $ramPct
+  }
+  disks = @($disks)
+  gpus = @($gpus)
+  windows_users = @($users)
+  windows_sessions = @($sessions)
+} | ConvertTo-Json -Depth 6 -Compress
+"#;
+        run_ps_json(ps)
+    }
+    #[cfg(not(windows))]
+    {
+        json!({
+            "hostname": "unknown",
+            "cpu": { "name": "unknown", "cores": 0, "logical_processors": 0, "load_pct": 0.0 },
+            "ram": { "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "load_pct": 0.0 },
+            "disks": [],
+            "gpus": [],
+            "windows_users": [],
+            "windows_sessions": []
+        })
+    }
+}
+
+pub fn trigger_reboot(delay_secs: u64) -> CommandExecResult {
+    let delay = delay_secs.clamp(2, 120);
+    #[cfg(windows)]
+    {
+        execute_shell_command(
+            "powershell",
+            &format!(
+                "shutdown.exe /r /t {delay} /c 'AgentDesk: reinicio remoto con auto-reconexion'"
+            ),
+            10,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = delay;
+        CommandExecResult {
+            ok: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "reboot solo soportado en Windows".into(),
+            duration_ms: 0,
+        }
+    }
+}
+
+pub fn lock_workstation() -> CommandExecResult {
+    #[cfg(windows)]
+    {
+        execute_shell_command("powershell", "rundll32.exe user32.dll,LockWorkStation", 10)
+    }
+    #[cfg(not(windows))]
+    {
+        CommandExecResult {
+            ok: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "lock solo soportado en Windows".into(),
+            duration_ms: 0,
+        }
+    }
+}
+
+pub fn sign_out_windows_user(session_id: Option<&str>) -> CommandExecResult {
+    #[cfg(windows)]
+    {
+        let cmd = match session_id.map(str::trim).filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())) {
+            Some(id) => format!("logoff {id}"),
+            None => "shutdown.exe /l".to_string(),
+        };
+        execute_shell_command("powershell", &cmd, 10)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = session_id;
+        CommandExecResult {
+            ok: false,
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "signout solo soportado en Windows".into(),
+            duration_ms: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +514,13 @@ mod tests {
         let res = execute_shell_command("powershell", "Write-Output 'AGENTDESK_RMM_OK'", 10);
         assert!(res.ok);
         assert!(res.stdout.contains("AGENTDESK_RMM_OK"));
+    }
+
+    #[test]
+    fn collect_hardware_resources_has_cpu_ram_and_disks() {
+        let hw = collect_hardware_resources();
+        assert!(hw.get("cpu").is_some());
+        assert!(hw.get("ram").and_then(|r| r.get("total_gb")).and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0);
+        assert!(hw.get("disks").and_then(|d| d.as_array()).map(|a| !a.is_empty()).unwrap_or(false));
     }
 }

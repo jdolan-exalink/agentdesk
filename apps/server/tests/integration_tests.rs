@@ -149,6 +149,7 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             is_favorite: true,
             notes: "Ventana mantenimiento 19h".into(),
             scheduled_next_at: None,
+            group_id: None,
         })
         .send()
         .await
@@ -321,6 +322,8 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             screen_height: 1080,
             private_mem_mb: 32.0,
             access_password: "init9999".into(),
+            owner_email: None,
+            personal_password: None,
         })
         .send()
         .await
@@ -344,6 +347,7 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
         .json(&DirectConnectRequest {
             connection_id: reg.connection_id.replace(' ', ""),
             password: "wrong".into(),
+            reconnect_token: None,
             caller_name: Some("Tester".into()),
             allow_control: true,
             allow_clipboard: true,
@@ -372,6 +376,7 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
         .json(&DirectConnectRequest {
             connection_id: reg.connection_id.replace(' ', ""),
             password: "rotated88".into(),
+            reconnect_token: None,
             caller_name: Some("Peer Viewer".into()),
             allow_control: true,
             allow_clipboard: true,
@@ -383,6 +388,7 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
         .await
         .unwrap();
     assert_eq!(ok_conn.target_connection_id, reg.connection_id);
+    assert!(ok_conn.reconnect_token.is_some());
     assert!(ok_conn.relay_ws_path.contains(&ok_conn.session_id.to_string()));
 
     // 10. Public /docs, /support/status, Calendar overlap 409, MFA setup/verify, CSV report, AI OAuth PKCE & MCP
@@ -474,4 +480,115 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
         .await
         .unwrap();
     assert_eq!(mcp_tools["result"]["tools"].as_array().unwrap().len(), 3);
+
+    // Change Password + Login verification (for admin A)
+    let cp_resp = client
+        .post(format!("{base}/api/v1/auth/change-password"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "current_password": "Password123!",
+            "new_password": "EvenStronger456!"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cp_resp.status(), StatusCode::OK);
+
+    let re_login = client
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": "admin@alpha.test",
+            "password": "EvenStronger456!"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(re_login.status(), StatusCode::OK);
+
+    // Quick register peer with personal password + owner_email, connect with personal pw & 1h reconnect_token
+    let pk_hex = DeviceIdentity::generate().public_key_hex();
+    let reg_resp: agentdesk_protocol::QuickRegisterResponse = client
+        .post(format!("{base}/api/v1/clients/register"))
+        .json(&serde_json::json!({
+            "ed25519_pubkey": pk_hex,
+            "hostname": "PC-TEST-DESKTOP",
+            "os_name": "Windows 11",
+            "os_arch": "x86_64",
+            "agent_version": "0.1.0",
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "private_mem_mb": 42.0,
+            "access_password": "RandPass99",
+            "owner_email": "admin@alpha.test",
+            "personal_password": "FixedPersonal77!"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Group creation, sharing with Org A technician & device assignment by connection ID + email
+    let tech_user_resp = client
+        .post(format!("{base}/api/v1/users"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "email": "tech2@alfa.local",
+            "display_name": "Tech Two",
+            "password": "TechPassword123!",
+            "role": "technician"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tech_user_resp.status(), StatusCode::OK);
+
+    let grp: agentdesk_protocol::DeviceGroupDto = client
+        .post(format!("{base}/api/v1/groups"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "name": "Sucursal Sur",
+            "description": "Equipos críticos"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let share_resp = client
+        .post(format!("{base}/api/v1/groups/{}/shares", grp.id))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "user_email": "tech2@alfa.local",
+            "permission": "read_write"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(share_resp.status(), StatusCode::OK);
+
+    let assign_resp: agentdesk_protocol::AssignDeviceResponse = client
+        .post(format!("{base}/api/v1/devices/assign"))
+        .bearer_auth(&auth_a.token)
+        .json(&serde_json::json!({
+            "connection_id": reg_resp.connection_id,
+            "owner_email": "tech2@alfa.local",
+            "group_id": grp.id,
+            "alias": "Caja Sur 01"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(assign_resp.device.owner_email.as_deref(), Some("tech2@alfa.local"));
+    assert!(assign_resp.device.has_personal_password);
+    assert_eq!(
+        assign_resp.address_book_entry.as_ref().unwrap().group_id,
+        Some(grp.id)
+    );
 }

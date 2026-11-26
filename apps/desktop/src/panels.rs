@@ -1,7 +1,7 @@
-use crate::theme::{primary_button, styled_card};
-use crate::{AgentDeskApp, NavTab, UiEvent};
+use crate::theme::{primary_button, styled_card, Palette};
+use crate::{AgentDeskApp, UiEvent};
 use agentdesk_protocol::{
-    AiChatRequest, AiChatResponse, AiExecuteActionRequest, AiSettingsDto, CalendarEventDto,
+    DeviceGroupDto, AiChatRequest, AiChatResponse, AiExecuteActionRequest, AiSettingsDto, CalendarEventDto,
     CreateCalendarEventRequest, CreateUserRequest, MfaSetupResponse, MfaVerifyRequest, RmmCommandDto,
     RunCommandRequest, RunDiagnosticRequest, UpdateAiSettingsRequest, UserDto,
 };
@@ -119,6 +119,11 @@ impl AgentDeskApp {
             if let Ok(r) = http.get(format!("{base}/api/v1/users")).bearer_auth(&token).send().await {
                 if let Ok(u) = r.json::<Vec<UserDto>>().await {
                     let _ = tx.send(UiEvent::UsersLoaded(u));
+                }
+            }
+            if let Ok(r) = http.get(format!("{base}/api/v1/groups")).bearer_auth(&token).send().await {
+                if let Ok(g) = r.json::<Vec<DeviceGroupDto>>().await {
+                    let _ = tx.send(UiEvent::GroupsLoaded(g));
                 }
             }
         });
@@ -465,6 +470,7 @@ impl AgentDeskApp {
                     ("inventory", "🖥 Inventario"),
                     ("services", "⚙ Servicios"),
                     ("events", "📋 Eventos Windows"),
+                    ("resources", "⚙ Recursos HW (CPU/RAM/Disco/GPU)"),
                 ] {
                     if ui.button(label).clicked() {
                         let auth = self.auth.as_ref().unwrap();
@@ -501,6 +507,10 @@ impl AgentDeskApp {
                 }
             });
 
+            if let Some(hw) = self.rmm_hw_snapshot.clone() {
+                ui.add_space(6.0);
+                render_hardware_resources_ui(ui, &p, &hw);
+            }
             if !self.rmm_diag_output.is_empty() {
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
@@ -857,5 +867,381 @@ impl AgentDeskApp {
             });
             ui.add_space(4.0);
         }
+    }
+}
+
+/// Busca el bloque de recursos HW (`cpu`/`ram`) dentro de una respuesta de diagnóstico.
+pub fn extract_resources(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let candidates = [
+        Some(v),
+        v.get("data"),
+        v.get("data").and_then(|d| d.get("resources")),
+        v.get("resources"),
+        v.get("result"),
+        v.get("result").and_then(|d| d.get("resources")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.get("cpu").is_some() && c.get("ram").is_some() {
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
+fn load_color(p: &Palette, pct: f32) -> egui::Color32 {
+    if pct >= 90.0 {
+        p.danger
+    } else if pct >= 70.0 {
+        p.warn
+    } else {
+        p.ok
+    }
+}
+
+fn gauge(ui: &mut egui::Ui, p: &Palette, label: &str, pct: f32, detail: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).strong().color(p.text_primary));
+        ui.label(RichText::new(detail).small().color(p.text_muted));
+    });
+    let frac = (pct / 100.0).clamp(0.0, 1.0);
+    ui.add(
+        egui::ProgressBar::new(frac)
+            .fill(load_color(p, pct))
+            .text(format!("{pct:.0}%"))
+            .desired_width(f32::INFINITY),
+    );
+    ui.add_space(4.0);
+}
+
+pub fn render_hardware_resources_ui(ui: &mut egui::Ui, p: &Palette, hw: &serde_json::Value) {
+    let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let s = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or("-").to_string()
+    };
+
+    let host = s(hw, "hostname");
+    let os = s(hw, "os_caption");
+    let up = f(hw, "uptime_hours");
+    ui.label(
+        RichText::new(format!("{host} · {os} · uptime {up:.1} h"))
+            .small()
+            .color(p.text_muted),
+    );
+    ui.add_space(4.0);
+
+    if let Some(cpu) = hw.get("cpu") {
+        gauge(
+            ui,
+            p,
+            "Procesador",
+            f(cpu, "load_pct") as f32,
+            &format!(
+                "{} · {} núcleos / {} hilos",
+                s(cpu, "name"),
+                f(cpu, "cores") as i64,
+                f(cpu, "logical_processors") as i64
+            ),
+        );
+    }
+    if let Some(ram) = hw.get("ram") {
+        gauge(
+            ui,
+            p,
+            "Memoria RAM",
+            f(ram, "load_pct") as f32,
+            &format!(
+                "{:.1} GB usados de {:.1} GB (libres {:.1} GB)",
+                f(ram, "used_gb"),
+                f(ram, "total_gb"),
+                f(ram, "free_gb")
+            ),
+        );
+    }
+    if let Some(disks) = hw.get("disks").and_then(|d| d.as_array()) {
+        for d in disks {
+            let status = s(d, "status");
+            gauge(
+                ui,
+                p,
+                &format!("Disco {} ({})", s(d, "drive"), s(d, "label")),
+                f(d, "used_pct") as f32,
+                &format!(
+                    "{:.0} GB libres de {:.0} GB · estado: {status}",
+                    f(d, "free_gb"),
+                    f(d, "total_gb")
+                ),
+            );
+        }
+    }
+    if let Some(gpus) = hw.get("gpus").and_then(|d| d.as_array()) {
+        for g in gpus {
+            let vram = g
+                .get("vram_gb")
+                .and_then(|x| x.as_f64())
+                .map(|v| format!("{v:.1} GB VRAM"))
+                .unwrap_or_else(|| "VRAM n/d".into());
+            let detail = format!("{} · driver {} · {}", vram, s(g, "driver"), s(g, "status"));
+            match g.get("load_pct").and_then(|x| x.as_f64()) {
+                Some(load) => gauge(ui, p, &format!("GPU {}", s(g, "name")), load as f32, &detail),
+                None => {
+                    ui.label(RichText::new(format!("GPU {}", s(g, "name"))).strong().color(p.text_primary));
+                    ui.label(RichText::new(format!("{detail} · carga n/d")).small().color(p.text_muted));
+                    ui.add_space(4.0);
+                }
+            }
+        }
+    }
+    if let Some(users) = hw.get("windows_users").and_then(|d| d.as_array()) {
+        let names: Vec<String> = users
+            .iter()
+            .map(|u| {
+                let en = u.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                format!("{}{}", s(u, "name"), if en { "" } else { " (deshab.)" })
+            })
+            .collect();
+        ui.label(
+            RichText::new(format!("Usuarios Windows: {}", names.join(", ")))
+                .small()
+                .color(p.text_muted),
+        );
+    }
+    if let Some(sess) = hw.get("windows_sessions").and_then(|d| d.as_array()) {
+        for se in sess {
+            ui.label(
+                RichText::new(format!(
+                    "Sesión #{} · {} · {}",
+                    s(se, "id"),
+                    s(se, "username"),
+                    s(se, "state")
+                ))
+                .small()
+                .color(p.text_muted),
+            );
+        }
+    }
+}
+
+impl AgentDeskApp {
+    /// Lanza una llamada autenticada a la API; al terminar muestra un toast y refresca datos.
+    pub fn fire_api(
+        &self,
+        method: reqwest::Method,
+        path: String,
+        body: Option<serde_json::Value>,
+        ok_msg: String,
+    ) {
+        let Some(auth) = &self.auth else { return };
+        let http = self.http.clone();
+        let tx = self.ui_tx.clone();
+        let base = self.server_url.trim_end_matches('/').to_string();
+        let token = auth.token.clone();
+        self.rt.spawn(async move {
+            let mut rb = http.request(method, format!("{base}{path}")).bearer_auth(&token);
+            if let Some(b) = body {
+                rb = rb.json(&b);
+            }
+            match rb.send().await {
+                Ok(r) if r.status().is_success() => {
+                    let _ = tx.send(UiEvent::Toast(ok_msg));
+                    let _ = tx.send(UiEvent::RefreshRequested);
+                }
+                Ok(r) => {
+                    let txt = r.text().await.unwrap_or_default();
+                    let msg = serde_json::from_str::<serde_json::Value>(&txt)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                        .unwrap_or(txt);
+                    let _ = tx.send(UiEvent::Toast(format!("Error: {msg}")));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Toast(format!("Error de red: {e}")));
+                }
+            }
+        });
+    }
+
+    pub fn ui_groups(&mut self, ui: &mut egui::Ui) {
+        if self.auth.is_none() {
+            self.ui_account_login_card(ui, "Grupos y Compartición");
+            return;
+        }
+        let p = self.palette;
+        ui.heading("Grupos de equipos y compartición");
+        ui.label(
+            RichText::new("Creá grupos, compartilos con otros usuarios registrados y registrá equipos por ID de conexión o por email.")
+                .small()
+                .color(p.text_muted),
+        );
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            styled_card(&p).show(ui, |ui| {
+                ui.strong("Crear grupo");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Nombre:");
+                    ui.add(egui::TextEdit::singleline(&mut self.new_group_name).desired_width(180.0));
+                    ui.label("Descripción:");
+                    ui.add(egui::TextEdit::singleline(&mut self.new_group_desc).desired_width(240.0));
+                    if ui.add(primary_button(&p, "+ Crear grupo")).clicked()
+                        && !self.new_group_name.trim().is_empty()
+                    {
+                        self.fire_api(
+                            reqwest::Method::POST,
+                            "/api/v1/groups".into(),
+                            Some(serde_json::json!({
+                                "name": self.new_group_name.trim(),
+                                "description": self.new_group_desc.trim()
+                            })),
+                            "Grupo creado".into(),
+                        );
+                        self.new_group_name.clear();
+                        self.new_group_desc.clear();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            styled_card(&p).show(ui, |ui| {
+                ui.strong("Registrar / asignar equipo por ID o email");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("ID de conexión:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.assign_conn_id)
+                            .hint_text("123 456 789")
+                            .desired_width(130.0),
+                    );
+                    ui.label("Email usuario:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.assign_email)
+                            .hint_text("tecnico@empresa.com (opcional)")
+                            .desired_width(220.0),
+                    );
+                    ui.label("Alias:");
+                    ui.add(egui::TextEdit::singleline(&mut self.assign_alias).desired_width(130.0));
+                });
+                let names: Vec<String> = std::iter::once("Sin grupo".to_string())
+                    .chain(self.groups.iter().map(|g| g.name.clone()))
+                    .collect();
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("assign_group")
+                        .selected_text(names.get(self.assign_group_idx).cloned().unwrap_or_default())
+                        .show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.assign_group_idx, i, n);
+                            }
+                        });
+                    if ui.add(primary_button(&p, "Registrar equipo")).clicked()
+                        && !self.assign_conn_id.trim().is_empty()
+                    {
+                        let gid = if self.assign_group_idx > 0 {
+                            self.groups.get(self.assign_group_idx - 1).map(|g| g.id)
+                        } else {
+                            None
+                        };
+                        self.fire_api(
+                            reqwest::Method::POST,
+                            "/api/v1/devices/assign".into(),
+                            Some(serde_json::json!({
+                                "connection_id": self.assign_conn_id.trim(),
+                                "owner_email": if self.assign_email.trim().is_empty() { None } else { Some(self.assign_email.trim().to_string()) },
+                                "group_id": gid,
+                                "alias": if self.assign_alias.trim().is_empty() { None } else { Some(self.assign_alias.trim().to_string()) },
+                            })),
+                            "Equipo registrado/asignado".into(),
+                        );
+                        self.assign_conn_id.clear();
+                        self.assign_email.clear();
+                        self.assign_alias.clear();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            let groups = self.groups.clone();
+            if groups.is_empty() {
+                ui.label(RichText::new("Todavía no hay grupos.").color(p.text_muted));
+            }
+            for g in groups {
+                styled_card(&p).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(format!("📁 {}", g.name));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} equipos · propietario {} · tu permiso: {}",
+                                g.device_count, g.owner_email, g.my_permission
+                            ))
+                            .small()
+                            .color(p.text_muted),
+                        );
+                        if g.my_permission == "full_control"
+                            && ui.add(crate::theme::danger_button(&p, "Eliminar grupo")).clicked()
+                        {
+                            self.fire_api(
+                                reqwest::Method::DELETE,
+                                format!("/api/v1/groups/{}", g.id),
+                                None,
+                                "Grupo eliminado".into(),
+                            );
+                        }
+                    });
+                    if !g.description.is_empty() {
+                        ui.label(RichText::new(&g.description).small().color(p.text_muted));
+                    }
+                    for sh in &g.shares {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("🤝 {} — {}", sh.user_email, sh.permission));
+                            if g.my_permission == "full_control" && ui.small_button("× quitar").clicked() {
+                                self.fire_api(
+                                    reqwest::Method::DELETE,
+                                    format!("/api/v1/groups/{}/shares/{}", g.id, sh.user_id),
+                                    None,
+                                    "Compartición revocada".into(),
+                                );
+                            }
+                        });
+                    }
+                    if g.my_permission == "full_control" {
+                        let perm = self
+                            .share_perm_map
+                            .entry(g.id)
+                            .or_insert_with(|| "read_only".to_string())
+                            .clone();
+                        let mut email = self.share_email_map.get(&g.id).cloned().unwrap_or_default();
+                        let mut new_perm = perm.clone();
+                        let mut do_share = false;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Compartir con:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut email)
+                                    .hint_text("email@empresa.com")
+                                    .desired_width(210.0),
+                            );
+                            egui::ComboBox::from_id_salt(format!("perm_{}", g.id))
+                                .selected_text(new_perm.clone())
+                                .show_ui(ui, |ui| {
+                                    for pm in ["read_only", "read_write", "full_control"] {
+                                        ui.selectable_value(&mut new_perm, pm.to_string(), pm);
+                                    }
+                                });
+                            if ui.button("Compartir").clicked() && !email.trim().is_empty() {
+                                do_share = true;
+                            }
+                        });
+                        self.share_perm_map.insert(g.id, new_perm.clone());
+                        if do_share {
+                            self.fire_api(
+                                reqwest::Method::POST,
+                                format!("/api/v1/groups/{}/shares", g.id),
+                                Some(serde_json::json!({ "user_email": email.trim(), "permission": new_perm })),
+                                "Grupo compartido".into(),
+                            );
+                            email.clear();
+                        }
+                        self.share_email_map.insert(g.id, email);
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
     }
 }

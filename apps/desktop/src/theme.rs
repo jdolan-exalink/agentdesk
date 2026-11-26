@@ -31,6 +31,7 @@ impl ThemeMode {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
+    #[allow(dead_code)]
     pub mode: ThemeMode,
     pub canvas_bg: Color32,
     pub sidebar_bg: Color32,

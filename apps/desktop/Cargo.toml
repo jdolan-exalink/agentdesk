@@ -35,3 +35,4 @@ uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+tray-icon.workspace = true

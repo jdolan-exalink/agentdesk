@@ -33,15 +33,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
+        .route("/api/v1/auth/change-password", post(auth::change_password))
         // Enrollments & Devices & Instant Peer Registration
         .route("/api/v1/enrollments", get(api::list_enrollments).post(api::create_enrollment))
         .route("/api/v1/enrollments/{id}", delete(api::revoke_enrollment))
         .route("/api/v1/devices/enroll", post(api::enroll_device))
         .route("/api/v1/devices/heartbeat", post(api::device_heartbeat))
+        .route("/api/v1/devices/assign", post(rmm_ai_api::assign_device))
         .route("/api/v1/devices", get(api::list_devices))
         .route("/api/v1/clients/register", post(api::quick_register_client))
         .route("/api/v1/clients/password", post(api::rotate_client_password))
+        .route("/api/v1/clients/personal-password", post(api::set_personal_password))
         .route("/api/v1/sessions/connect-by-id", post(api::connect_by_id))
+        // Device Groups & Sharing
+        .route("/api/v1/groups", get(rmm_ai_api::list_groups).post(rmm_ai_api::create_group))
+        .route("/api/v1/groups/{id}", delete(rmm_ai_api::delete_group))
+        .route("/api/v1/groups/{id}/shares", post(rmm_ai_api::share_group))
+        .route("/api/v1/groups/{id}/shares/{user_id}", delete(rmm_ai_api::unshare_group))
         // Address Book (Clientes Agendados)
         .route("/api/v1/address-book", get(api::list_address_book).post(api::create_address_book_entry))
         .route(

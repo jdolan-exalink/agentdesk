@@ -694,6 +694,7 @@ fn run_diagnostic_sync(
     match kind {
         "inventory" => (true, agentdesk_rmm::collect_inventory(), None, None),
         "metrics" => (true, agentdesk_rmm::collect_metrics(), None, None),
+        "resources" => (true, agentdesk_rmm::collect_hardware_resources(), None, None),
         "services" => (true, agentdesk_rmm::collect_services(), None, None),
         "events" => (true, agentdesk_rmm::collect_recent_events(), None, None),
         "screenshot" => {
@@ -710,6 +711,7 @@ fn run_diagnostic_sync(
             let data = serde_json::json!({
                 "inventory": agentdesk_rmm::collect_inventory(),
                 "metrics": agentdesk_rmm::collect_metrics(),
+                "resources": agentdesk_rmm::collect_hardware_resources(),
                 "services": agentdesk_rmm::collect_services(),
                 "events": agentdesk_rmm::collect_recent_events(),
             });
@@ -834,6 +836,46 @@ async fn run_host_session(
                     Ok(DataPacket::Control(ControlMessage::SpecialKey { combo })) => {
                         if allow_control {
                             inject_special_combo(&combo);
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::RequestHardwareResources)) => {
+                        let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
+                            .await
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let _ = tunnel
+                            .send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
+                                resources_json: hw.to_string(),
+                            }))
+                            .await;
+                    }
+                    Ok(DataPacket::Control(ControlMessage::SessionAction { action, target_user, delay_secs })) => {
+                        if allow_control {
+                            match action.as_str() {
+                                "reboot" => {
+                                    let delay = delay_secs.unwrap_or(5).clamp(2, 120);
+                                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::RebootPending {
+                                        delay_secs: delay,
+                                        reason: "Reinicio remoto solicitado".into(),
+                                    })).await;
+                                    let _ = tokio::task::spawn_blocking(move || agentdesk_rmm::trigger_reboot(delay)).await;
+                                }
+                                "lock" => {
+                                    let _ = tokio::task::spawn_blocking(agentdesk_rmm::lock_workstation).await;
+                                }
+                                "signout" | "switch_user" => {
+                                    let sid = target_user.clone();
+                                    let _ = tokio::task::spawn_blocking(move || agentdesk_rmm::sign_out_windows_user(sid.as_deref())).await;
+                                }
+                                "list_users" => {
+                                    let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
+                                        .await
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
+                                        resources_json: hw.to_string(),
+                                    })).await;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::FileOffer { transfer_id, filename, size_bytes, sha256 })) => {

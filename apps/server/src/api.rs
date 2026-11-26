@@ -9,7 +9,7 @@ use agentdesk_protocol::{
     DeviceDto, DirectConnectRequest, DirectConnectResponse, DownloadArtifactDto,
     EnrollDeviceRequest, EnrollDeviceResponse, EnrollmentDto, HeartbeatRequest,
     QuickRegisterRequest, QuickRegisterResponse, RotatePasswordRequest, ServerToAgentMessage,
-    SessionDto, SupportTicketDto, UpsertAddressBookRequest,
+    SessionDto, SetPersonalPasswordRequest, SupportTicketDto, UpsertAddressBookRequest,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -330,8 +330,13 @@ pub async fn list_devices(
     auth: AuthContext,
 ) -> Result<Json<Vec<DeviceDto>>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, organization_id, public_code, ed25519_pubkey, hostname, os_name, os_arch, agent_version, kind, screen_width, screen_height, private_mem_mb, status, last_heartbeat_at
-         FROM devices WHERE organization_id = $1 ORDER BY status DESC, last_heartbeat_at DESC",
+        "SELECT d.id, d.organization_id, d.public_code, d.ed25519_pubkey, d.hostname, d.os_name, d.os_arch,
+                d.agent_version, d.kind, d.screen_width, d.screen_height, d.private_mem_mb, d.status,
+                d.last_heartbeat_at, d.personal_password_hash, u.email AS owner_email
+         FROM devices d
+         LEFT JOIN users u ON u.id = d.owner_user_id
+         WHERE d.organization_id = $1
+         ORDER BY d.status DESC, d.last_heartbeat_at DESC",
     )
     .bind(auth.user.organization_id)
     .fetch_all(&state.pool)
@@ -354,13 +359,17 @@ pub async fn list_devices(
                 private_mem_mb: r.get("private_mem_mb"),
                 status: r.get("status"),
                 last_heartbeat_at: r.get("last_heartbeat_at"),
+                owner_email: r.get("owner_email"),
+                has_personal_password: r
+                    .get::<Option<String>, _>("personal_password_hash")
+                    .is_some(),
             })
             .collect(),
     ))
 }
 
 // ---------------------------------------------------------------------------
-// Address Book / Clientes Agendados (IAM-04)
+// Address Book / Clientes Agendados (IAM-04 + Grupos Compartidos)
 // ---------------------------------------------------------------------------
 
 pub async fn list_address_book(
@@ -368,17 +377,27 @@ pub async fn list_address_book(
     auth: AuthContext,
 ) -> Result<Json<Vec<AddressBookEntryDto>>, ApiError> {
     let rows = sqlx::query(
-        "SELECT a.id, a.organization_id, a.device_id, a.alias, a.client_company, a.contact_name,
+        "SELECT a.id, a.organization_id, a.device_id, a.group_id, a.alias, a.client_company, a.contact_name,
                 a.contact_email, a.group_name, a.is_favorite, a.notes, a.scheduled_next_at,
                 a.created_at, a.updated_at,
                 d.public_code AS device_public_code, d.hostname AS device_hostname,
                 d.status AS device_status, d.os_name AS device_os, d.last_heartbeat_at AS device_last_heartbeat
          FROM address_book_entries a
          LEFT JOIN devices d ON d.id = a.device_id AND d.organization_id = a.organization_id
+         LEFT JOIN device_groups g ON g.id = a.group_id
+         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
          WHERE a.organization_id = $1
+           AND (
+             a.group_id IS NULL
+             OR g.owner_user_id = $2
+             OR s.user_id IS NOT NULL
+             OR $3 IN ('admin', 'org_admin')
+           )
          ORDER BY a.is_favorite DESC, a.scheduled_next_at ASC NULLS LAST, a.alias ASC",
     )
     .bind(auth.user.organization_id)
+    .bind(auth.user.id)
+    .bind(&auth.user.role)
     .fetch_all(&state.pool)
     .await?;
 
@@ -388,6 +407,7 @@ pub async fn list_address_book(
                 id: r.get("id"),
                 organization_id: r.get("organization_id"),
                 device_id: r.get("device_id"),
+                group_id: r.get("group_id"),
                 alias: r.get("alias"),
                 client_company: r.get("client_company"),
                 contact_name: r.get("contact_name"),
@@ -406,6 +426,45 @@ pub async fn list_address_book(
             })
             .collect(),
     ))
+}
+
+async fn resolve_group_name_for_write(
+    pool: &sqlx::PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+    user_role: &str,
+    group_id: Option<Uuid>,
+    fallback_name: &str,
+) -> Result<String, ApiError> {
+    if let Some(gid) = group_id {
+        let row = sqlx::query(
+            "SELECT g.name, g.owner_user_id, s.permission
+             FROM device_groups g
+             LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+             WHERE g.id = $1 AND g.organization_id = $3",
+        )
+        .bind(gid)
+        .bind(user_id)
+        .bind(org_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
+
+        let owner_id: Uuid = row.get("owner_user_id");
+        let share_perm: Option<String> = row.get("permission");
+        let can_write = owner_id == user_id
+            || crate::state::is_admin_role(user_role)
+            || matches!(share_perm.as_deref(), Some("read_write") | Some("full_control"));
+        if !can_write {
+            return Err(ApiError::unauthorized("sin permiso de escritura sobre este grupo"));
+        }
+        return Ok(row.get("name"));
+    }
+    Ok(if fallback_name.trim().is_empty() {
+        "General".to_string()
+    } else {
+        fallback_name.trim().to_string()
+    })
 }
 
 pub async fn create_address_book_entry(
@@ -429,19 +488,30 @@ pub async fn create_address_book_entry(
         }
     }
 
+    let resolved_group_name = resolve_group_name_for_write(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        req.group_id,
+        &req.group_name,
+    )
+    .await?;
+
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO address_book_entries (id, organization_id, device_id, alias, client_company, contact_name, contact_email, group_name, is_favorite, notes, scheduled_next_at, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO address_book_entries (id, organization_id, device_id, group_id, alias, client_company, contact_name, contact_email, group_name, is_favorite, notes, scheduled_next_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(auth.user.organization_id)
     .bind(req.device_id)
+    .bind(req.group_id)
     .bind(req.alias.trim())
     .bind(req.client_company.trim())
     .bind(req.contact_name.trim())
     .bind(req.contact_email.trim())
-    .bind(if req.group_name.trim().is_empty() { "General" } else { req.group_name.trim() })
+    .bind(&resolved_group_name)
     .bind(req.is_favorite)
     .bind(req.notes.trim())
     .bind(req.scheduled_next_at)
@@ -458,7 +528,7 @@ pub async fn create_address_book_entry(
         "address_book_entry",
         &id.to_string(),
         "success",
-        json!({ "alias": req.alias.trim() }),
+        json!({ "alias": req.alias.trim(), "group": resolved_group_name }),
     )
     .await;
 
@@ -484,20 +554,31 @@ pub async fn update_address_book_entry(
         }
     }
 
+    let resolved_group_name = resolve_group_name_for_write(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        req.group_id,
+        &req.group_name,
+    )
+    .await?;
+
     let res = sqlx::query(
         "UPDATE address_book_entries
-         SET device_id = $3, alias = $4, client_company = $5, contact_name = $6, contact_email = $7,
-             group_name = $8, is_favorite = $9, notes = $10, scheduled_next_at = $11, updated_at = now()
+         SET device_id = $3, group_id = $4, alias = $5, client_company = $6, contact_name = $7, contact_email = $8,
+             group_name = $9, is_favorite = $10, notes = $11, scheduled_next_at = $12, updated_at = now()
          WHERE id = $1 AND organization_id = $2",
     )
     .bind(id)
     .bind(auth.user.organization_id)
     .bind(req.device_id)
+    .bind(req.group_id)
     .bind(req.alias.trim())
     .bind(req.client_company.trim())
     .bind(req.contact_name.trim())
     .bind(req.contact_email.trim())
-    .bind(if req.group_name.trim().is_empty() { "General" } else { req.group_name.trim() })
+    .bind(&resolved_group_name)
     .bind(req.is_favorite)
     .bind(req.notes.trim())
     .bind(req.scheduled_next_at)
@@ -535,7 +616,7 @@ async fn fetch_address_book_entry(
     org_id: Uuid,
 ) -> Result<AddressBookEntryDto, ApiError> {
     let r = sqlx::query(
-        "SELECT a.id, a.organization_id, a.device_id, a.alias, a.client_company, a.contact_name,
+        "SELECT a.id, a.organization_id, a.device_id, a.group_id, a.alias, a.client_company, a.contact_name,
                 a.contact_email, a.group_name, a.is_favorite, a.notes, a.scheduled_next_at,
                 a.created_at, a.updated_at,
                 d.public_code AS device_public_code, d.hostname AS device_hostname,
@@ -554,6 +635,7 @@ async fn fetch_address_book_entry(
         id: r.get("id"),
         organization_id: r.get("organization_id"),
         device_id: r.get("device_id"),
+        group_id: r.get("group_id"),
         alias: r.get("alias"),
         client_company: r.get("client_company"),
         contact_name: r.get("contact_name"),
@@ -947,6 +1029,23 @@ pub async fn quick_register_client(
         .ok_or_else(|| ApiError::bad_request("instance is not bootstrapped yet"))?;
 
     let pw_hash = hash_password(trimmed_pw).map_err(|e| ApiError::internal(e.to_string()))?;
+    let personal_hash = match req.personal_password.as_deref().map(str::trim) {
+        Some(pp) if pp.len() >= 4 => {
+            Some(hash_password(pp).map_err(|e| ApiError::internal(e.to_string()))?)
+        }
+        _ => None,
+    };
+    let owner_user_id: Option<Uuid> = match req.owner_email.as_deref().map(str::trim) {
+        Some(em) if !em.is_empty() => sqlx::query_scalar(
+            "SELECT id FROM users WHERE organization_id = $1 AND LOWER(email) = LOWER($2)",
+        )
+        .bind(org_id)
+        .bind(em)
+        .fetch_optional(&state.pool)
+        .await?,
+        _ => None,
+    };
+
     let device_token = generate_high_entropy_token();
     let device_token_hash = sha256_hex(device_token.as_bytes());
 
@@ -966,6 +1065,8 @@ pub async fn quick_register_client(
             "UPDATE devices SET device_token_hash = $2, access_password_hash = $3, hostname = $4,
              os_name = $5, os_arch = $6, agent_version = $7, kind = 'desktop',
              screen_width = $8, screen_height = $9, private_mem_mb = $10,
+             personal_password_hash = COALESCE($11, personal_password_hash),
+             owner_user_id = COALESCE($12, owner_user_id),
              status = 'online', last_heartbeat_at = now()
              WHERE id = $1",
         )
@@ -979,6 +1080,8 @@ pub async fn quick_register_client(
         .bind(req.screen_width)
         .bind(req.screen_height)
         .bind(req.private_mem_mb)
+        .bind(&personal_hash)
+        .bind(owner_user_id)
         .execute(&mut *tx)
         .await?;
         (did, pcode)
@@ -997,8 +1100,8 @@ pub async fn quick_register_client(
             chosen_code = generate_numeric_connection_id();
         }
         sqlx::query(
-            "INSERT INTO devices (id, organization_id, public_code, ed25519_pubkey, device_token_hash, access_password_hash, hostname, os_name, os_arch, agent_version, kind, screen_width, screen_height, private_mem_mb, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'desktop', $11, $12, $13, 'online')",
+            "INSERT INTO devices (id, organization_id, public_code, ed25519_pubkey, device_token_hash, access_password_hash, personal_password_hash, owner_user_id, hostname, os_name, os_arch, agent_version, kind, screen_width, screen_height, private_mem_mb, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'desktop', $13, $14, $15, 'online')",
         )
         .bind(did)
         .bind(org_id)
@@ -1006,6 +1109,8 @@ pub async fn quick_register_client(
         .bind(&req.ed25519_pubkey)
         .bind(&device_token_hash)
         .bind(&pw_hash)
+        .bind(&personal_hash)
+        .bind(owner_user_id)
         .bind(&req.hostname)
         .bind(&req.os_name)
         .bind(&req.os_arch)
@@ -1082,6 +1187,44 @@ pub async fn rotate_client_password(
     Ok(Json(json!({ "ok": true })))
 }
 
+pub async fn set_personal_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetPersonalPasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let raw = headers
+        .get("x-device-token")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("missing x-device-token"))?;
+    let thash = sha256_hex(raw.as_bytes());
+
+    let personal_hash = match req.personal_password.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(pw) if pw.len() < 4 => {
+            return Err(ApiError::bad_request(
+                "personal_password must be at least 4 characters",
+            ))
+        }
+        Some(pw) => Some(hash_password(pw).map_err(|e| ApiError::internal(e.to_string()))?),
+    };
+
+    let res = sqlx::query(
+        "UPDATE devices SET personal_password_hash = $3, last_heartbeat_at = now()
+         WHERE id = $1 AND device_token_hash = $2",
+    )
+    .bind(req.device_id)
+    .bind(&thash)
+    .bind(&personal_hash)
+    .execute(&state.pool)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::unauthorized("invalid device credentials"));
+    }
+
+    Ok(Json(json!({ "ok": true, "has_personal_password": personal_hash.is_some() })))
+}
+
 pub async fn connect_by_id(
     State(state): State<AppState>,
     Json(req): Json<DirectConnectRequest>,
@@ -1090,12 +1233,20 @@ pub async fn connect_by_id(
     if norm.is_empty() {
         return Err(ApiError::bad_request("connection_id requerido"));
     }
-    if req.password.trim().is_empty() {
-        return Err(ApiError::bad_request("contraseña requerida"));
+    let reconnect_tok = req
+        .reconnect_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let raw_pw = req.password.trim();
+    if raw_pw.is_empty() && reconnect_tok.is_none() {
+        return Err(ApiError::bad_request(
+            "contraseña o token de reconexión requerido",
+        ));
     }
 
     let row = sqlx::query(
-        "SELECT id, organization_id, hostname, public_code, ed25519_pubkey, access_password_hash
+        "SELECT id, organization_id, hostname, public_code, ed25519_pubkey, access_password_hash, personal_password_hash
          FROM devices
          WHERE regexp_replace(UPPER(public_code), '[^A-Z0-9]', '', 'g') = $1
          LIMIT 1",
@@ -1105,19 +1256,46 @@ pub async fn connect_by_id(
     .await?
     .ok_or_else(|| ApiError::unauthorized("ID o contraseña incorrectos"))?;
 
-    let stored_hash: Option<String> = row.get("access_password_hash");
-    let Some(pw_hash) = stored_hash else {
-        return Err(ApiError::unauthorized("ID o contraseña incorrectos"));
-    };
-    if !verify_password(req.password.trim(), &pw_hash).unwrap_or(false) {
-        return Err(ApiError::unauthorized("ID o contraseña incorrectos"));
-    }
-
     let device_id: Uuid = row.get("id");
     let org_id: Uuid = row.get("organization_id");
     let target_hostname: String = row.get("hostname");
     let target_connection_id: String = row.get("public_code");
     let device_pubkey: String = row.get("ed25519_pubkey");
+
+    let mut authenticated = false;
+    if !raw_pw.is_empty() {
+        let access_hash: Option<String> = row.get("access_password_hash");
+        let personal_hash: Option<String> = row.get("personal_password_hash");
+        let access_ok = access_hash
+            .as_deref()
+            .map(|h| verify_password(raw_pw, h).unwrap_or(false))
+            .unwrap_or(false);
+        let personal_ok = personal_hash
+            .as_deref()
+            .map(|h| verify_password(raw_pw, h).unwrap_or(false))
+            .unwrap_or(false);
+        authenticated = access_ok || personal_ok;
+    } else if let Some(tok) = reconnect_tok {
+        let thash = sha256_hex(tok.as_bytes());
+        let valid: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM direct_reconnect_grants
+             WHERE device_id = $1 AND token_hash = $2 AND expires_at > now()",
+        )
+        .bind(device_id)
+        .bind(&thash)
+        .fetch_optional(&state.pool)
+        .await?;
+        authenticated = valid.is_some();
+        if !authenticated {
+            return Err(ApiError::unauthorized(
+                "La ventana de reconexión de 1 hora expiró. Ingresá la contraseña.",
+            ));
+        }
+    }
+
+    if !authenticated {
+        return Err(ApiError::unauthorized("ID o contraseña incorrectos"));
+    }
 
     let agent_tx = {
         let agents = state.active_agents.read().await;
@@ -1150,6 +1328,25 @@ pub async fn connect_by_id(
     .bind(&viewer_relay_token)
     .execute(&state.pool)
     .await?;
+
+    // Emitir token efímero de 1 hora para reconexiones rápidas / Reboot & Reconnect sin guardar contraseñas en disco
+    let _ = sqlx::query("DELETE FROM direct_reconnect_grants WHERE expires_at < now()")
+        .execute(&state.pool)
+        .await;
+    let fresh_reconnect_token = generate_high_entropy_token();
+    let fresh_reconnect_hash = sha256_hex(fresh_reconnect_token.as_bytes());
+    let reconnect_expires_at = Utc::now() + Duration::hours(1);
+    let _ = sqlx::query(
+        "INSERT INTO direct_reconnect_grants (id, device_id, token_hash, caller_label, expires_at)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(device_id)
+    .bind(&fresh_reconnect_hash)
+    .bind(&caller_label)
+    .bind(reconnect_expires_at)
+    .execute(&state.pool)
+    .await;
 
     let relay_ws_path = format!("/ws/relay/{session_id}");
     let _ = agent_tx.send(ServerToAgentMessage::IncomingSession {
@@ -1189,6 +1386,8 @@ pub async fn connect_by_id(
         target_hostname,
         target_connection_id,
         device_pubkey,
+        reconnect_token: Some(fresh_reconnect_token),
+        reconnect_expires_at: Some(reconnect_expires_at),
     }))
 }
 
