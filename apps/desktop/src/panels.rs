@@ -1,9 +1,10 @@
-use crate::theme::{primary_button, styled_card, Palette};
-use crate::{AgentDeskApp, UiEvent};
+use crate::theme::{centered_text_edit, placeholder_text, primary_button, styled_card, Palette};
+use crate::{AgentDeskApp, NavTab, UiEvent};
 use agentdesk_protocol::{
-    DeviceGroupDto, AiChatRequest, AiChatResponse, AiExecuteActionRequest, AiSettingsDto, CalendarEventDto,
-    CreateCalendarEventRequest, CreateUserRequest, MfaSetupResponse, MfaVerifyRequest, RmmCommandDto,
-    RunCommandRequest, RunDiagnosticRequest, UpdateAiSettingsRequest, UserDto,
+    AiChatRequest, AiChatResponse, AiExecuteActionRequest, AiSettingsDto, CalendarEventDto,
+    CreateCalendarEventRequest, CreateUserRequest, DeviceGroupDto, MfaSetupResponse,
+    MfaVerifyRequest, RmmCommandDto, RunCommandRequest, RunDiagnosticRequest,
+    UpdateAiSettingsRequest, UserDto,
 };
 use chrono::Utc;
 use eframe::egui::{self, RichText};
@@ -97,6 +98,74 @@ fn open_url_in_browser(url: &str) {
     }
 }
 
+pub fn render_percent_trend(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    current: f64,
+    samples: &[f64],
+) {
+    styled_card(p).show(ui, |ui| {
+        ui.set_min_width(132.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).small().color(p.text_muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.strong(format!("{:.0}%", current.clamp(0.0, 100.0)));
+            });
+        });
+
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(96.0), 38.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4, p.input_bg);
+        let plot = rect.shrink(4.0);
+        for level in [0.25_f32, 0.5, 0.75] {
+            let y = plot.bottom() - plot.height() * level;
+            painter.line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                egui::Stroke::new(0.5_f32, p.card_border),
+            );
+        }
+
+        if samples.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Sin muestras previas",
+                egui::FontId::proportional(10.0),
+                p.text_muted,
+            );
+        } else {
+            let denominator = samples.len().saturating_sub(1).max(1) as f32;
+            let points: Vec<_> = samples
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let x = plot.left() + plot.width() * index as f32 / denominator;
+                    let y = plot.bottom() - plot.height() * value.clamp(0.0, 100.0) as f32 / 100.0;
+                    egui::pos2(x, y)
+                })
+                .collect();
+            if points.len() > 1 {
+                painter.add(egui::Shape::line(
+                    points.clone(),
+                    egui::Stroke::new(1.8_f32, p.accent),
+                ));
+            }
+            if let Some(last) = points.last() {
+                painter.circle_filled(*last, 2.5, p.accent);
+            }
+        }
+        ui.label(
+            RichText::new(format!("{} muestras guardadas", samples.len()))
+                .small()
+                .color(p.text_muted),
+        );
+    });
+}
+
 impl AgentDeskApp {
     pub fn load_extra_tabs_data(&self) {
         let Some(auth) = &self.auth else { return };
@@ -106,22 +175,42 @@ impl AgentDeskApp {
         let token = auth.token.clone();
 
         self.rt.spawn(async move {
-            if let Ok(r) = http.get(format!("{base}/api/v1/ai/settings")).bearer_auth(&token).send().await {
+            if let Ok(r) = http
+                .get(format!("{base}/api/v1/ai/settings"))
+                .bearer_auth(&token)
+                .send()
+                .await
+            {
                 if let Ok(s) = r.json::<AiSettingsDto>().await {
                     let _ = tx.send(UiEvent::AiSettingsLoaded(s));
                 }
             }
-            if let Ok(r) = http.get(format!("{base}/api/v1/calendar")).bearer_auth(&token).send().await {
+            if let Ok(r) = http
+                .get(format!("{base}/api/v1/calendar"))
+                .bearer_auth(&token)
+                .send()
+                .await
+            {
                 if let Ok(ev) = r.json::<Vec<CalendarEventDto>>().await {
                     let _ = tx.send(UiEvent::CalendarLoaded(ev));
                 }
             }
-            if let Ok(r) = http.get(format!("{base}/api/v1/users")).bearer_auth(&token).send().await {
+            if let Ok(r) = http
+                .get(format!("{base}/api/v1/users"))
+                .bearer_auth(&token)
+                .send()
+                .await
+            {
                 if let Ok(u) = r.json::<Vec<UserDto>>().await {
                     let _ = tx.send(UiEvent::UsersLoaded(u));
                 }
             }
-            if let Ok(r) = http.get(format!("{base}/api/v1/groups")).bearer_auth(&token).send().await {
+            if let Ok(r) = http
+                .get(format!("{base}/api/v1/groups"))
+                .bearer_auth(&token)
+                .send()
+                .await
+            {
                 if let Ok(g) = r.json::<Vec<DeviceGroupDto>>().await {
                     let _ = tx.send(UiEvent::GroupsLoaded(g));
                 }
@@ -138,140 +227,202 @@ impl AgentDeskApp {
         ui.horizontal(|ui| {
             ui.heading("Copiloto de Soporte IA");
             ui.label(
-                RichText::new("Inspecciona máquinas, analiza capturas y ejecuta acciones bajo aprobación.")
-                    .small()
-                    .color(p.text_muted),
+                RichText::new(
+                    "Inspecciona máquinas, analiza capturas y ejecuta acciones bajo aprobación.",
+                )
+                .small()
+                .color(p.text_muted),
             );
         });
         ui.separator();
 
-        egui::CollapsingHeader::new("⚙ Configuración de Proveedor IA (ChatGPT OAuth PKCE / OpenAI / Ollama)")
-            .default_open(self.ai_settings.is_none())
-            .show(ui, |ui| {
-                styled_card(&p).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Proveedor:");
-                        for (val, label) in [
-                            ("chat_gpt_o_auth", "ChatGPT OAuth"),
-                            ("openai_api", "OpenAI API"),
-                            ("ollama_local", "Ollama Local"),
-                            ("disabled", "Deshabilitado"),
-                        ] {
-                            ui.selectable_value(&mut self.ai_provider, val.to_string(), label);
+        if let Some(ticket_id) = self.ai_ticket_context {
+            let ticket = self
+                .tickets
+                .iter()
+                .find(|ticket| ticket.id == ticket_id)
+                .cloned();
+            styled_card(&p).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Contexto de solicitud");
+                    if let Some(ticket) = &ticket {
+                        ui.label(RichText::new(&ticket.public_code).monospace().color(p.accent));
+                        if !ticket.company_name.is_empty() {
+                            ui.label(&ticket.company_name);
                         }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Modelo:");
-                        ui.add(egui::TextEdit::singleline(&mut self.ai_model).desired_width(170.0));
-                        ui.label("Base URL:");
-                        ui.add(egui::TextEdit::singleline(&mut self.ai_base_url).desired_width(260.0));
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("API Key / Token manual:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ai_api_key)
-                                .password(true)
-                                .hint_text("sk-... (opcional si usas OAuth o Ollama)")
-                                .desired_width(300.0),
-                        );
-                        ui.checkbox(&mut self.ai_redact_pii, "Redactar secretos/PII antes de enviar");
-                    });
+                        if !ticket.category.is_empty() {
+                            ui.label(RichText::new(&ticket.category).small().color(p.text_muted));
+                        }
+                    } else {
+                        ui.colored_label(p.warn, "El ticket ya no está en la lista cargada.");
+                    }
+                    if ui.small_button("Quitar contexto").clicked() {
+                        self.ai_ticket_context = None;
+                        self.ai_resolution_draft = None;
+                    }
+                    if ticket.is_some() && ui.button("Preparar borrador de resolución").clicked() {
+                        self.ai_prompt = "Redacta un borrador breve de resolución para este ticket. Separa diagnóstico, acciones realizadas y pendientes. No inventes datos ni afirmes acciones que no figuren en el contexto; indica lo que no se pudo verificar.".into();
+                    }
+                });
+                if let Some(ticket) = ticket {
+                    ui.label(RichText::new(ticket.description).color(p.text_primary));
+                    if let Some(device_id) = ticket.device_id {
+                        if let Some(device) = self.devices.iter().find(|device| device.id == device_id) {
+                            ui.label(RichText::new(format!("Equipo asociado: {} ({})", device.hostname, device.public_code)).small().color(p.text_muted));
+                        } else {
+                            ui.colored_label(p.warn, "El ticket tiene un equipo asociado que no está disponible para esta cuenta.");
+                        }
+                    }
+                }
+            });
+        }
 
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(primary_button(&p, "Guardar configuración IA")).clicked() {
-                            let auth = self.auth.as_ref().unwrap();
-                            let http = self.http.clone();
-                            let tx = self.ui_tx.clone();
-                            let base = self.server_url.trim_end_matches('/').to_string();
-                            let token = auth.token.clone();
-                            let payload = UpdateAiSettingsRequest {
-                                provider: self.ai_provider.clone(),
-                                model: self.ai_model.clone(),
-                                base_url: self.ai_base_url.clone(),
-                                api_key: if self.ai_api_key.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(self.ai_api_key.clone())
-                                },
-                                oauth_client_id: Some(self.ai_oauth_client_id.clone()),
-                                oauth_auth_url: None,
-                                oauth_token_url: None,
-                                oauth_manual_token: if self.ai_oauth_manual_token.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(self.ai_oauth_manual_token.clone())
-                                },
-                                autonomy_level: self.ai_autonomy.clone(),
-                                redact_pii: self.ai_redact_pii,
-                            };
-                            self.rt.spawn(async move {
-                                match http
-                                    .put(format!("{base}/api/v1/ai/settings"))
-                                    .bearer_auth(&token)
-                                    .json(&payload)
-                                    .send()
-                                    .await
-                                {
-                                    Ok(r) if r.status().is_success() => {
-                                        if let Ok(s) = r.json::<AiSettingsDto>().await {
-                                            let _ = tx.send(UiEvent::AiSettingsLoaded(s));
-                                            let _ = tx.send(UiEvent::Toast("Configuración IA guardada".into()));
-                                        }
-                                    }
-                                    Ok(r) => {
-                                        let _ = tx.send(UiEvent::Toast(format!("Error IA settings: {}", r.status())));
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(UiEvent::Toast(format!("Error red: {e}")));
+        egui::CollapsingHeader::new(
+            "⚙ Configuración de Proveedor IA (ChatGPT OAuth PKCE / OpenAI / Ollama)",
+        )
+        .default_open(self.ai_settings.is_none())
+        .show(ui, |ui| {
+            styled_card(&p).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Proveedor:");
+                    for (val, label) in [
+                        ("chat_gpt_o_auth", "ChatGPT OAuth"),
+                        ("openai_api", "OpenAI API"),
+                        ("ollama_local", "Ollama Local"),
+                        ("disabled", "Deshabilitado"),
+                    ] {
+                        ui.selectable_value(&mut self.ai_provider, val.to_string(), label);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Modelo:");
+                    ui.add(centered_text_edit(&mut self.ai_model).desired_width(170.0));
+                    ui.label("Base URL:");
+                    ui.add(centered_text_edit(&mut self.ai_base_url).desired_width(260.0));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("API Key / Token manual:");
+                    ui.add(
+                        centered_text_edit(&mut self.ai_api_key)
+                            .password(true)
+                            .hint_text(placeholder_text(
+                                &p,
+                                "sk-... (opcional si usas OAuth o Ollama)",
+                            ))
+                            .desired_width(300.0),
+                    );
+                    ui.checkbox(
+                        &mut self.ai_redact_pii,
+                        "Redactar secretos/PII antes de enviar",
+                    );
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(primary_button(&p, "Guardar configuración IA"))
+                        .clicked()
+                    {
+                        let auth = self.auth.as_ref().unwrap();
+                        let http = self.http.clone();
+                        let tx = self.ui_tx.clone();
+                        let base = self.server_url.trim_end_matches('/').to_string();
+                        let token = auth.token.clone();
+                        let payload = UpdateAiSettingsRequest {
+                            provider: self.ai_provider.clone(),
+                            model: self.ai_model.clone(),
+                            base_url: self.ai_base_url.clone(),
+                            api_key: if self.ai_api_key.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.ai_api_key.clone())
+                            },
+                            oauth_client_id: Some(self.ai_oauth_client_id.clone()),
+                            oauth_auth_url: None,
+                            oauth_token_url: None,
+                            oauth_manual_token: if self.ai_oauth_manual_token.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.ai_oauth_manual_token.clone())
+                            },
+                            autonomy_level: self.ai_autonomy.clone(),
+                            redact_pii: self.ai_redact_pii,
+                            reasoning_effort: "high".into(),
+                        };
+                        self.rt.spawn(async move {
+                            match http
+                                .put(format!("{base}/api/v1/ai/settings"))
+                                .bearer_auth(&token)
+                                .json(&payload)
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    if let Ok(s) = r.json::<AiSettingsDto>().await {
+                                        let _ = tx.send(UiEvent::AiSettingsLoaded(s));
+                                        let _ = tx.send(UiEvent::Toast(
+                                            "Configuración IA guardada".into(),
+                                        ));
                                     }
                                 }
-                            });
-                        }
+                                Ok(r) => {
+                                    let _ = tx.send(UiEvent::Toast(format!(
+                                        "Error IA settings: {}",
+                                        r.status()
+                                    )));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiEvent::Toast(format!("Error red: {e}")));
+                                }
+                            }
+                        });
+                    }
 
-                        if ui.button("🔐 Conectar con ChatGPT (OAuth PKCE)").clicked() {
-                            let auth = self.auth.as_ref().unwrap();
-                            let http = self.http.clone();
-                            let tx = self.ui_tx.clone();
-                            let base = self.server_url.trim_end_matches('/').to_string();
-                            let token = auth.token.clone();
-                            self.rt.spawn(async move {
-                                if let Ok(r) = http
-                                    .get(format!("{base}/api/v1/ai/oauth/start"))
-                                    .bearer_auth(&token)
-                                    .send()
-                                    .await
-                                {
-                                    if let Ok(v) = r.json::<serde_json::Value>().await {
-                                        if let Some(u) = v.get("authorize_url").and_then(|s| s.as_str()) {
-                                            open_url_in_browser(u);
-                                            let _ = tx.send(UiEvent::AiOAuthUrl(u.to_string()));
-                                        }
+                    if ui.button("🔐 Conectar con ChatGPT (OAuth PKCE)").clicked() {
+                        let auth = self.auth.as_ref().unwrap();
+                        let http = self.http.clone();
+                        let tx = self.ui_tx.clone();
+                        let base = self.server_url.trim_end_matches('/').to_string();
+                        let token = auth.token.clone();
+                        self.rt.spawn(async move {
+                            if let Ok(r) = http
+                                .get(format!("{base}/api/v1/ai/oauth/start"))
+                                .bearer_auth(&token)
+                                .send()
+                                .await
+                            {
+                                if let Ok(v) = r.json::<serde_json::Value>().await {
+                                    if let Some(u) = v.get("authorize_url").and_then(|s| s.as_str())
+                                    {
+                                        open_url_in_browser(u);
+                                        let _ = tx.send(UiEvent::AiOAuthUrl(u.to_string()));
                                     }
                                 }
-                            });
-                        }
+                            }
+                        });
+                    }
 
-                        if let Some(s) = &self.ai_settings {
-                            let badge = if s.oauth_connected || s.has_api_key || s.provider == "ollama_local" {
+                    if let Some(s) = &self.ai_settings {
+                        let badge =
+                            if s.oauth_connected || s.has_api_key || s.provider == "ollama_local" {
                                 ("● Listo", p.ok)
                             } else {
                                 ("○ Falta credencial OAuth/API", p.warn)
                             };
-                            ui.colored_label(badge.1, badge.0);
-                        }
-                    });
-
-                    if !self.ai_oauth_url.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label("URL OAuth generada:");
-                            ui.add(egui::TextEdit::singleline(&mut self.ai_oauth_url).desired_width(420.0));
-                            if ui.button("Copiar").clicked() {
-                                ctx.copy_text(self.ai_oauth_url.clone());
-                            }
-                        });
+                        ui.colored_label(badge.1, badge.0);
                     }
                 });
+
+                if !self.ai_oauth_url.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("URL OAuth generada:");
+                        ui.add(centered_text_edit(&mut self.ai_oauth_url).desired_width(420.0));
+                        if ui.button("Copiar").clicked() {
+                            ctx.copy_text(self.ai_oauth_url.clone());
+                        }
+                    });
+                }
             });
+        });
 
         ui.add_space(6.0);
         styled_card(&p).show(ui, |ui| {
@@ -283,13 +434,20 @@ impl AgentDeskApp {
                 self.ai_device_idx = 0;
             }
             ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_label("Máquina a inspeccionar")
-                    .selected_text(dev_labels[self.ai_device_idx].clone())
-                    .show_ui(ui, |ui| {
-                        for (i, lbl) in dev_labels.iter().enumerate() {
-                            ui.selectable_value(&mut self.ai_device_idx, i, lbl);
-                        }
-                    });
+                let ticket_device = self.ai_ticket_context
+                    .and_then(|ticket_id| self.tickets.iter().find(|ticket| ticket.id == ticket_id))
+                    .and_then(|ticket| ticket.device_id);
+                if ticket_device.is_some() {
+                    ui.label(format!("Equipo del ticket: {}", dev_labels[self.ai_device_idx]));
+                } else {
+                    egui::ComboBox::from_label("Máquina a inspeccionar")
+                        .selected_text(dev_labels[self.ai_device_idx].clone())
+                        .show_ui(ui, |ui| {
+                            for (i, lbl) in dev_labels.iter().enumerate() {
+                                ui.selectable_value(&mut self.ai_device_idx, i, lbl);
+                            }
+                        });
+                }
                 ui.checkbox(&mut self.ai_include_diag, "📊 Adjuntar diagnóstico en vivo");
                 ui.checkbox(&mut self.ai_include_shot, "📸 Adjuntar captura de pantalla");
             });
@@ -306,19 +464,66 @@ impl AgentDeskApp {
                     }
                 });
 
+            let mut apply_resolution_draft: Option<(Uuid, String)> = None;
+            if let Some((ticket_id, draft)) = self.ai_resolution_draft.as_mut() {
+                if self.ai_ticket_context == Some(*ticket_id) {
+                    ui.separator();
+                    styled_card(&p).show(ui, |ui| {
+                        ui.strong("Borrador para revisar");
+                        ui.label(RichText::new("La IA solo propone el texto. Editalo y confirmá el resultado antes de cerrar el ticket.").small().color(p.text_muted));
+                        ui.add(egui::TextEdit::multiline(draft).desired_rows(4).desired_width(f32::INFINITY));
+                        if ui.button("Llevar al formulario de resolución").clicked() {
+                            apply_resolution_draft = Some((*ticket_id, draft.clone()));
+                        }
+                    });
+                }
+            }
+            if let Some((ticket_id, draft)) = apply_resolution_draft {
+                if let Some(ticket) = self.tickets.iter().find(|ticket| ticket.id == ticket_id) {
+                    self.ticket_resolution_summary = draft;
+                    self.ticket_resolution_outcome = "resolved".into();
+                    self.ticket_resolution_error.clear();
+                    self.ticket_close_confirm = Some((ticket_id, ticket.public_code.clone()));
+                    self.tab = NavTab::Tickets;
+                }
+            }
+
             if !self.ai_proposed_actions.is_empty() {
                 ui.separator();
                 ui.strong("Acciones propuestas por la IA (requieren tu aprobación):");
                 let selected_dev_id = if self.ai_device_idx > 0 {
                     self.devices.get(self.ai_device_idx - 1).map(|d| d.id)
                 } else {
-                    self.devices.first().map(|d| d.id)
+                    None
                 };
                 for act in self.ai_proposed_actions.clone() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("[{}] {} — {}", act.risk_level, act.title, act.command));
+                    styled_card(&p).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let risk_color = match act.risk_level.to_lowercase().as_str() {
+                                "critical" | "high" => p.danger,
+                                "medium" => p.warn,
+                                _ => p.ok,
+                            };
+                            ui.colored_label(risk_color, act.risk_level.to_uppercase());
+                            ui.strong(&act.title);
+                        });
+                        ui.label(
+                            RichText::new(&act.rationale)
+                                .small()
+                                .color(p.text_muted),
+                        );
+                        let mut command = act.command.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut command)
+                                .font(egui::FontId::monospace(13.0))
+                                .desired_rows(2)
+                                .interactive(false),
+                        );
                         if let Some(did) = selected_dev_id {
-                            if ui.add(primary_button(&p, "✅ Aprobar y ejecutar")).clicked() {
+                            if ui
+                                .add(primary_button(&p, "Aprobar y ejecutar en el equipo elegido"))
+                                .clicked()
+                            {
                                 let auth = self.auth.as_ref().unwrap();
                                 let http = self.http.clone();
                                 let tx = self.ui_tx.clone();
@@ -352,6 +557,11 @@ impl AgentDeskApp {
                                     }
                                 });
                             }
+                        } else {
+                            ui.colored_label(
+                                p.warn,
+                                "Elegí explícitamente un equipo antes de ejecutar esta acción.",
+                            );
                         }
                     });
                 }
@@ -360,8 +570,8 @@ impl AgentDeskApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.ai_prompt)
-                        .hint_text("Ej: Revisa el uso de CPU/RAM, servicios caídos y dime qué está fallando...")
+                    centered_text_edit(&mut self.ai_prompt)
+                        .hint_text(placeholder_text(&p, "Ej: Revisa el uso de CPU/RAM, servicios caídos y dime qué está fallando..."))
                         .desired_width(540.0),
                 );
                 let send_btn = ui.add_enabled(
@@ -375,6 +585,7 @@ impl AgentDeskApp {
                         None
                     };
                     let prompt = self.ai_prompt.clone();
+                    let ticket_id = self.ai_ticket_context;
                     self.ai_messages.push(("Técnico".into(), prompt.clone()));
                     self.ai_prompt.clear();
                     self.ai_busy = true;
@@ -392,10 +603,13 @@ impl AgentDeskApp {
                             .bearer_auth(&token)
                             .json(&AiChatRequest {
                                 device_id: did,
-                                ticket_id: None,
+                                ticket_id,
                                 prompt,
                                 include_diagnostics: inc_diag,
                                 include_screenshot: inc_shot,
+                                chat_session_id: None,
+                                model: None,
+                                reasoning_effort: None,
                             })
                             .send()
                             .await;
@@ -414,6 +628,8 @@ impl AgentDeskApp {
                                     model_used: String::new(),
                                     redacted_context_applied: true,
                                     diagnostics_snapshot: None,
+                                    chat_session_id: None,
+                                    reasoning_effort: "high".into(),
                                 }));
                             }
                             Err(e) => {
@@ -424,6 +640,8 @@ impl AgentDeskApp {
                                     model_used: String::new(),
                                     redacted_context_applied: true,
                                     diagnostics_snapshot: None,
+                                    chat_session_id: None,
+                                    reasoning_effort: "high".into(),
                                 }));
                             }
                         }
@@ -443,7 +661,9 @@ impl AgentDeskApp {
         ui.separator();
 
         if self.devices.is_empty() {
-            ui.label("No hay dispositivos registrados aún. Abre agentdesk-host o actualiza la lista.");
+            ui.label(
+                "No hay dispositivos registrados aún. Abre agentdesk-host o actualiza la lista.",
+            );
             return;
         }
         if self.rmm_device_idx >= self.devices.len() {
@@ -454,7 +674,10 @@ impl AgentDeskApp {
             let selected = self.devices[self.rmm_device_idx].clone();
             ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_label("Equipo")
-                    .selected_text(format!("{} ({}) [{}]", selected.hostname, selected.public_code, selected.status))
+                    .selected_text(format!(
+                        "{} ({}) [{}]",
+                        selected.hostname, selected.public_code, selected.status
+                    ))
                     .show_ui(ui, |ui| {
                         for (i, d) in self.devices.iter().enumerate() {
                             ui.selectable_value(
@@ -480,7 +703,8 @@ impl AgentDeskApp {
                         let token = auth.token.clone();
                         let did = selected.id;
                         let k = kind.to_string();
-                        self.rmm_diag_output = format!("Consultando {kind} en {}...", selected.hostname);
+                        self.rmm_diag_output =
+                            format!("Consultando {kind} en {}...", selected.hostname);
                         self.rt.spawn(async move {
                             match http
                                 .post(format!("{base}/api/v1/devices/{did}/diagnostics"))
@@ -496,10 +720,14 @@ impl AgentDeskApp {
                                 }
                                 Ok(r) => {
                                     let txt = r.text().await.unwrap_or_default();
-                                    let _ = tx.send(UiEvent::RmmDiagnosticResult(serde_json::json!({ "error": txt })));
+                                    let _ = tx.send(UiEvent::RmmDiagnosticResult(
+                                        serde_json::json!({ "error": txt }),
+                                    ));
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(UiEvent::RmmDiagnosticResult(serde_json::json!({ "error": e.to_string() })));
+                                    let _ = tx.send(UiEvent::RmmDiagnosticResult(
+                                        serde_json::json!({ "error": e.to_string() }),
+                                    ));
                                 }
                             }
                         });
@@ -513,9 +741,11 @@ impl AgentDeskApp {
             }
             if !self.rmm_diag_output.is_empty() {
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
-                    ui.monospace(&self.rmm_diag_output);
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(190.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&self.rmm_diag_output);
+                    });
             }
         });
 
@@ -527,11 +757,16 @@ impl AgentDeskApp {
                 ui.selectable_value(&mut self.rmm_shell, "powershell".into(), "PowerShell");
                 ui.selectable_value(&mut self.rmm_shell, "cmd".into(), "CMD");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.rmm_command)
-                        .hint_text("Ej: Get-Service AgentDesk* | Format-Table -AutoSize")
+                    centered_text_edit(&mut self.rmm_command)
+                        .hint_text(placeholder_text(
+                            &p,
+                            "Ej: Get-Service AgentDesk* | Format-Table -AutoSize",
+                        ))
                         .desired_width(480.0),
                 );
-                if ui.add(primary_button(&p, "Ejecutar")).clicked() && !self.rmm_command.trim().is_empty() {
+                if ui.add(primary_button(&p, "Ejecutar")).clicked()
+                    && !self.rmm_command.trim().is_empty()
+                {
                     let auth = self.auth.as_ref().unwrap();
                     let http = self.http.clone();
                     let tx = self.ui_tx.clone();
@@ -572,9 +807,11 @@ impl AgentDeskApp {
 
             if !self.rmm_cmd_output.is_empty() {
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
-                    ui.monospace(&self.rmm_cmd_output);
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(210.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&self.rmm_cmd_output);
+                    });
             }
         });
     }
@@ -587,7 +824,10 @@ impl AgentDeskApp {
         let p = self.palette;
         ui.horizontal(|ui| {
             ui.heading("Calendario Técnico y Reportes CSV");
-            if ui.add(primary_button(&p, "⬇ Exportar Sesiones CSV")).clicked() {
+            if ui
+                .add(primary_button(&p, "⬇ Exportar Sesiones CSV"))
+                .clicked()
+            {
                 let auth = self.auth.as_ref().unwrap();
                 let http = self.http.clone();
                 let tx = self.ui_tx.clone();
@@ -609,7 +849,10 @@ impl AgentDeskApp {
                             let _ = std::fs::create_dir_all(&dl_base);
                             let dest = dl_base.join("agentdesk-sessions.csv");
                             let _ = std::fs::write(&dest, csv);
-                            let _ = tx.send(UiEvent::Toast(format!("CSV guardado en {}", dest.display())));
+                            let _ = tx.send(UiEvent::Toast(format!(
+                                "CSV guardado en {}",
+                                dest.display()
+                            )));
                         }
                     }
                 });
@@ -624,18 +867,20 @@ impl AgentDeskApp {
             ui.strong("Agendar nueva cita técnica (con detección automática de conflictos)");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Título:");
-                ui.add(egui::TextEdit::singleline(&mut self.cal_title).desired_width(180.0));
+                ui.add(centered_text_edit(&mut self.cal_title).desired_width(180.0));
                 ui.label("Cliente:");
-                ui.add(egui::TextEdit::singleline(&mut self.cal_client).desired_width(150.0));
+                ui.add(centered_text_edit(&mut self.cal_client).desired_width(150.0));
                 ui.label("En horas:");
-                ui.add(egui::TextEdit::singleline(&mut self.cal_hours_from_now).desired_width(50.0));
+                ui.add(centered_text_edit(&mut self.cal_hours_from_now).desired_width(50.0));
                 ui.label("Duración (min):");
-                ui.add(egui::TextEdit::singleline(&mut self.cal_duration_mins).desired_width(55.0));
+                ui.add(centered_text_edit(&mut self.cal_duration_mins).desired_width(55.0));
             });
             ui.horizontal(|ui| {
                 ui.label("Notas:");
-                ui.add(egui::TextEdit::singleline(&mut self.cal_notes).desired_width(360.0));
-                if ui.add(primary_button(&p, "+ Agendar Cita")).clicked() && !self.cal_title.trim().is_empty() {
+                ui.add(centered_text_edit(&mut self.cal_notes).desired_width(360.0));
+                if ui.add(primary_button(&p, "+ Agendar Cita")).clicked()
+                    && !self.cal_title.trim().is_empty()
+                {
                     let h: i64 = self.cal_hours_from_now.trim().parse().unwrap_or(2);
                     let mins: i64 = self.cal_duration_mins.trim().parse().unwrap_or(60);
                     let starts = Utc::now() + chrono::Duration::hours(h.max(0));
@@ -664,7 +909,12 @@ impl AgentDeskApp {
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                if let Ok(ev) = http.get(format!("{base}/api/v1/calendar")).bearer_auth(&token).send().await {
+                                if let Ok(ev) = http
+                                    .get(format!("{base}/api/v1/calendar"))
+                                    .bearer_auth(&token)
+                                    .send()
+                                    .await
+                                {
                                     if let Ok(list) = ev.json::<Vec<CalendarEventDto>>().await {
                                         let _ = tx.send(UiEvent::CalendarLoaded(list));
                                     }
@@ -691,7 +941,10 @@ impl AgentDeskApp {
                 styled_card(&p).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(&ev.title);
-                        ui.label(format!("· {} · Técnico: {}", ev.client_name, ev.technician_name));
+                        ui.label(format!(
+                            "· {} · Técnico: {}",
+                            ev.client_name, ev.technician_name
+                        ));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Eliminar").clicked() {
                                 let auth = self.auth.as_ref().unwrap();
@@ -701,8 +954,17 @@ impl AgentDeskApp {
                                 let token = auth.token.clone();
                                 let eid: Uuid = ev.id;
                                 self.rt.spawn(async move {
-                                    let _ = http.delete(format!("{base}/api/v1/calendar/{eid}")).bearer_auth(&token).send().await;
-                                    if let Ok(r) = http.get(format!("{base}/api/v1/calendar")).bearer_auth(&token).send().await {
+                                    let _ = http
+                                        .delete(format!("{base}/api/v1/calendar/{eid}"))
+                                        .bearer_auth(&token)
+                                        .send()
+                                        .await;
+                                    if let Ok(r) = http
+                                        .get(format!("{base}/api/v1/calendar"))
+                                        .bearer_auth(&token)
+                                        .send()
+                                        .await
+                                    {
                                         if let Ok(list) = r.json::<Vec<CalendarEventDto>>().await {
                                             let _ = tx.send(UiEvent::CalendarLoaded(list));
                                         }
@@ -731,20 +993,28 @@ impl AgentDeskApp {
             return;
         }
         let p = self.palette;
-        ui.heading("Usuarios (7 Roles RBAC) y MFA TOTP");
+        ui.heading("Usuarios y seguridad");
         ui.separator();
 
         styled_card(&p).show(ui, |ui| {
-            ui.strong("Seguridad de mi cuenta — MFA TOTP (Google Authenticator / Authy)");
+            ui.strong("Verificación en dos pasos");
             ui.horizontal(|ui| {
-                if ui.add(primary_button(&p, "Generar secreto MFA TOTP")).clicked() {
+                if ui
+                    .add(primary_button(&p, "Generar secreto MFA TOTP"))
+                    .clicked()
+                {
                     let auth = self.auth.as_ref().unwrap();
                     let http = self.http.clone();
                     let tx = self.ui_tx.clone();
                     let base = self.server_url.trim_end_matches('/').to_string();
                     let token = auth.token.clone();
                     self.rt.spawn(async move {
-                        if let Ok(r) = http.post(format!("{base}/api/v1/auth/mfa/setup")).bearer_auth(&token).send().await {
+                        if let Ok(r) = http
+                            .post(format!("{base}/api/v1/auth/mfa/setup"))
+                            .bearer_auth(&token)
+                            .send()
+                            .await
+                        {
                             if let Ok(ms) = r.json::<MfaSetupResponse>().await {
                                 let _ = tx.send(UiEvent::MfaSetupResult(ms));
                             }
@@ -757,7 +1027,7 @@ impl AgentDeskApp {
                 ui.small(&mfa.otpauth_uri);
                 ui.horizontal(|ui| {
                     ui.label("Código 6 dígitos:");
-                    ui.add(egui::TextEdit::singleline(&mut self.mfa_code_input).desired_width(110.0));
+                    ui.add(centered_text_edit(&mut self.mfa_code_input).desired_width(110.0));
                     if ui.button("Verificar y activar MFA").clicked() {
                         let auth = self.auth.as_ref().unwrap();
                         let http = self.http.clone();
@@ -774,7 +1044,9 @@ impl AgentDeskApp {
                                 .await
                             {
                                 Ok(r) if r.status().is_success() => {
-                                    let _ = tx.send(UiEvent::Toast("MFA TOTP activado correctamente".into()));
+                                    let _ = tx.send(UiEvent::Toast(
+                                        "MFA TOTP activado correctamente".into(),
+                                    ));
                                 }
                                 _ => {
                                     let _ = tx.send(UiEvent::Toast("Código TOTP inválido".into()));
@@ -788,14 +1060,18 @@ impl AgentDeskApp {
 
         ui.add_space(10.0);
         styled_card(&p).show(ui, |ui| {
-            ui.strong("Alta rápida de usuario en la organización");
+            ui.strong("Nuevo usuario");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Email:");
-                ui.add(egui::TextEdit::singleline(&mut self.new_user_email).desired_width(170.0));
+                ui.add(centered_text_edit(&mut self.new_user_email).desired_width(170.0));
                 ui.label("Nombre:");
-                ui.add(egui::TextEdit::singleline(&mut self.new_user_name).desired_width(140.0));
-                ui.label("Pass:");
-                ui.add(egui::TextEdit::singleline(&mut self.new_user_pw).password(true).desired_width(110.0));
+                ui.add(centered_text_edit(&mut self.new_user_name).desired_width(140.0));
+                ui.label("Contraseña:");
+                ui.add(
+                    centered_text_edit(&mut self.new_user_pw)
+                        .password(true)
+                        .desired_width(110.0),
+                );
                 egui::ComboBox::from_label("Rol")
                     .selected_text(self.new_user_role.clone())
                     .show_ui(ui, |ui| {
@@ -832,7 +1108,12 @@ impl AgentDeskApp {
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                if let Ok(ur) = http.get(format!("{base}/api/v1/users")).bearer_auth(&token).send().await {
+                                if let Ok(ur) = http
+                                    .get(format!("{base}/api/v1/users"))
+                                    .bearer_auth(&token)
+                                    .send()
+                                    .await
+                                {
                                     if let Ok(list) = ur.json::<Vec<UserDto>>().await {
                                         let _ = tx.send(UiEvent::UsersLoaded(list));
                                     }
@@ -861,7 +1142,11 @@ impl AgentDeskApp {
                     ui.label(format!("Rol: {}", u.role));
                     ui.colored_label(
                         if u.mfa_enabled { p.ok } else { p.text_muted },
-                        if u.mfa_enabled { "● MFA activo" } else { "○ Sin MFA" },
+                        if u.mfa_enabled {
+                            "● MFA activo"
+                        } else {
+                            "○ Sin MFA"
+                        },
                     );
                 });
             });
@@ -901,16 +1186,25 @@ fn load_color(p: &Palette, pct: f32) -> egui::Color32 {
 fn gauge(ui: &mut egui::Ui, p: &Palette, label: &str, pct: f32, detail: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).strong().color(p.text_primary));
-        ui.label(RichText::new(detail).small().color(p.text_muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("{pct:.0}%"))
+                    .small()
+                    .strong()
+                    .color(load_color(p, pct)),
+            );
+        });
     });
+    ui.add(egui::Label::new(RichText::new(detail).small().color(p.text_muted)).truncate());
     let frac = (pct / 100.0).clamp(0.0, 1.0);
     ui.add(
         egui::ProgressBar::new(frac)
             .fill(load_color(p, pct))
-            .text(format!("{pct:.0}%"))
+            .text("")
+            .desired_height(7.0)
             .desired_width(f32::INFINITY),
     );
-    ui.add_space(4.0);
+    ui.add_space(7.0);
 }
 
 pub fn render_hardware_resources_ui(ui: &mut egui::Ui, p: &Palette, hw: &serde_json::Value) {
@@ -982,10 +1276,24 @@ pub fn render_hardware_resources_ui(ui: &mut egui::Ui, p: &Palette, hw: &serde_j
                 .unwrap_or_else(|| "VRAM n/d".into());
             let detail = format!("{} · driver {} · {}", vram, s(g, "driver"), s(g, "status"));
             match g.get("load_pct").and_then(|x| x.as_f64()) {
-                Some(load) => gauge(ui, p, &format!("GPU {}", s(g, "name")), load as f32, &detail),
+                Some(load) => gauge(
+                    ui,
+                    p,
+                    &format!("GPU {}", s(g, "name")),
+                    load as f32,
+                    &detail,
+                ),
                 None => {
-                    ui.label(RichText::new(format!("GPU {}", s(g, "name"))).strong().color(p.text_primary));
-                    ui.label(RichText::new(format!("{detail} · carga n/d")).small().color(p.text_muted));
+                    ui.label(
+                        RichText::new(format!("GPU {}", s(g, "name")))
+                            .strong()
+                            .color(p.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(format!("{detail} · carga n/d"))
+                            .small()
+                            .color(p.text_muted),
+                    );
                     ui.add_space(4.0);
                 }
             }
@@ -1036,7 +1344,9 @@ impl AgentDeskApp {
         let base = self.server_url.trim_end_matches('/').to_string();
         let token = auth.token.clone();
         self.rt.spawn(async move {
-            let mut rb = http.request(method, format!("{base}{path}")).bearer_auth(&token);
+            let mut rb = http
+                .request(method, format!("{base}{path}"))
+                .bearer_auth(&token);
             if let Some(b) = body {
                 rb = rb.json(&b);
             }
@@ -1049,7 +1359,11 @@ impl AgentDeskApp {
                     let txt = r.text().await.unwrap_or_default();
                     let msg = serde_json::from_str::<serde_json::Value>(&txt)
                         .ok()
-                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                        .and_then(|v| {
+                            v.get("error")
+                                .and_then(|e| e.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .unwrap_or(txt);
                     let _ = tx.send(UiEvent::Toast(format!("Error: {msg}")));
                 }
@@ -1079,9 +1393,9 @@ impl AgentDeskApp {
                 ui.strong("Crear grupo");
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Nombre:");
-                    ui.add(egui::TextEdit::singleline(&mut self.new_group_name).desired_width(180.0));
+                    ui.add(centered_text_edit(&mut self.new_group_name).desired_width(180.0));
                     ui.label("Descripción:");
-                    ui.add(egui::TextEdit::singleline(&mut self.new_group_desc).desired_width(240.0));
+                    ui.add(centered_text_edit(&mut self.new_group_desc).desired_width(240.0));
                     if ui.add(primary_button(&p, "+ Crear grupo")).clicked()
                         && !self.new_group_name.trim().is_empty()
                     {
@@ -1106,18 +1420,18 @@ impl AgentDeskApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("ID de conexión:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.assign_conn_id)
-                            .hint_text("123 456 789")
+                        centered_text_edit(&mut self.assign_conn_id)
+                            .hint_text(placeholder_text(&p, "123 456 789"))
                             .desired_width(130.0),
                     );
                     ui.label("Email usuario:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.assign_email)
-                            .hint_text("tecnico@empresa.com (opcional)")
+                        centered_text_edit(&mut self.assign_email)
+                            .hint_text(placeholder_text(&p, "tecnico@empresa.com (opcional)"))
                             .desired_width(220.0),
                     );
                     ui.label("Alias:");
-                    ui.add(egui::TextEdit::singleline(&mut self.assign_alias).desired_width(130.0));
+                    ui.add(centered_text_edit(&mut self.assign_alias).desired_width(130.0));
                 });
                 let names: Vec<String> = std::iter::once("Sin grupo".to_string())
                     .chain(self.groups.iter().map(|g| g.name.clone()))
@@ -1212,8 +1526,8 @@ impl AgentDeskApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Compartir con:");
                             ui.add(
-                                egui::TextEdit::singleline(&mut email)
-                                    .hint_text("email@empresa.com")
+                                centered_text_edit(&mut email)
+                                    .hint_text(placeholder_text(&p, "email@empresa.com"))
                                     .desired_width(210.0),
                             );
                             egui::ComboBox::from_id_salt(format!("perm_{}", g.id))

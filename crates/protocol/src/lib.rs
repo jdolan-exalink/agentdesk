@@ -21,6 +21,74 @@ pub enum ProtocolError {
 pub enum FrameEncoding {
     Jpeg,
     Lz4Rgba,
+    HybridTiles,
+    H264AnnexB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    ImaAdpcm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioPacket {
+    pub seq: u64,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub codec: AudioCodec,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCodecPreference {
+    Auto,
+    HardwareH264,
+    HybridTiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WhiteboardTool {
+    Pen,
+    Highlighter,
+    Arrow,
+    Rect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhiteboardStroke {
+    pub id: u64,
+    pub tool: WhiteboardTool,
+    pub color_rgba: u32,
+    pub thickness: f32,
+    pub points: Vec<(f32, f32)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrinterInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    Arrow,
+    IBeam,
+    Hand,
+    Wait,
+    SizeNS,
+    SizeWE,
+    SizeAll,
+    Cross,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileDropTarget {
+    Downloads,
+    Desktop,
+    Clipboard,
+    RemotePrint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,22 +128,130 @@ pub enum MouseBtn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
-    Ping { ts_ms: u64 },
-    Pong { ts_ms: u64 },
-    Chat { sender: String, text: String },
-    SetQuality { jpeg_quality: u8, max_fps: u8 },
-    Terminate { reason: String },
-    MonitorList { monitors: Vec<MonitorInfo>, active_index: usize },
-    SelectMonitor { index: usize },
-    ClipboardText { text: String },
-    SpecialKey { combo: String },
-    FileOffer { transfer_id: Uuid, filename: String, size_bytes: u64, sha256: String },
-    FileChunk { transfer_id: Uuid, offset: u64, data: Vec<u8>, eof: bool },
-    FileAck { transfer_id: Uuid, ok: bool, message: String },
+    Ping {
+        ts_ms: u64,
+    },
+    Pong {
+        ts_ms: u64,
+    },
+    Chat {
+        sender: String,
+        text: String,
+    },
+    SetQuality {
+        jpeg_quality: u8,
+        max_fps: u8,
+    },
+    Terminate {
+        reason: String,
+    },
+    MonitorList {
+        monitors: Vec<MonitorInfo>,
+        active_index: usize,
+    },
+    SelectMonitor {
+        index: usize,
+    },
+    ClipboardText {
+        text: String,
+    },
+    SpecialKey {
+        combo: String,
+    },
+    FileOffer {
+        transfer_id: Uuid,
+        filename: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    FileChunk {
+        transfer_id: Uuid,
+        offset: u64,
+        data: Vec<u8>,
+        eof: bool,
+    },
+    FileAck {
+        transfer_id: Uuid,
+        ok: bool,
+        message: String,
+    },
     RequestHardwareResources,
-    HardwareResourcesSnapshot { resources_json: String },
-    SessionAction { action: String, target_user: Option<String>, delay_secs: Option<u64> },
-    RebootPending { delay_secs: u64, reason: String },
+    HardwareResourcesSnapshot {
+        resources_json: String,
+    },
+    SessionAction {
+        action: String,
+        target_user: Option<String>,
+        delay_secs: Option<u64>,
+    },
+    RebootPending {
+        delay_secs: u64,
+        reason: String,
+    },
+    FrameAck {
+        seq: u64,
+        decode_ms: u16,
+    },
+    RequestKeyframe,
+    StreamPolicy {
+        max_width: u16,
+        jpeg_quality: u8,
+        max_fps: u8,
+        auto_adapt: bool,
+    },
+    CursorUpdate {
+        x_norm: f32,
+        y_norm: f32,
+        visible: bool,
+        shape: CursorShape,
+    },
+    P2pOffer {
+        session_nonce: [u8; 16],
+        p2p_key: [u8; 32],
+        endpoints: Vec<String>,
+    },
+    P2pReady {
+        remote_addr: String,
+    },
+    FileOfferEx {
+        transfer_id: Uuid,
+        filename: String,
+        size_bytes: u64,
+        sha256: String,
+        target: FileDropTarget,
+    },
+    AudioControl {
+        enabled: bool,
+    },
+    VideoCodecPolicy {
+        preference: VideoCodecPreference,
+    },
+    VideoCodecActive {
+        codec_name: String,
+        hardware: bool,
+    },
+    WhiteboardStroke(WhiteboardStroke),
+    WhiteboardUndo,
+    WhiteboardClear,
+    WhiteboardToggle {
+        active: bool,
+    },
+    RequestPrinters,
+    PrinterList {
+        printers: Vec<PrinterInfo>,
+    },
+    RemotePrintJob {
+        job_id: Uuid,
+        filename: String,
+        printer_name: Option<String>,
+        sha256: String,
+        size_bytes: u64,
+    },
+    RemotePrintResult {
+        job_id: Uuid,
+        ok: bool,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +259,7 @@ pub enum DataPacket {
     VideoFrame(VideoFrame),
     Input(InputEvent),
     Control(ControlMessage),
+    Audio(AudioPacket),
 }
 
 impl DataPacket {
@@ -136,6 +313,11 @@ pub enum ServerToAgentMessage {
         command: String,
         timeout_secs: u64,
     },
+    SendWakeOnLan {
+        request_id: Uuid,
+        mac_addresses: Vec<String>,
+        broadcast_ips: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +327,10 @@ pub enum AgentToServerMessage {
         screen_width: i32,
         screen_height: i32,
         private_mem_mb: f64,
+        #[serde(default)]
+        mac_addresses: Vec<String>,
+        #[serde(default)]
+        lan_ips: Vec<String>,
     },
     SessionConsentResult {
         session_id: Uuid,
@@ -166,6 +352,12 @@ pub enum AgentToServerMessage {
         stderr: String,
         duration_ms: u64,
     },
+    WolResult {
+        request_id: Uuid,
+        ok: bool,
+        sent_count: usize,
+        detail: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +378,8 @@ pub struct BootstrapRequest {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +437,10 @@ pub struct EnrollDeviceRequest {
     pub screen_width: i32,
     pub screen_height: i32,
     pub private_mem_mb: f64,
+    #[serde(default)]
+    pub mac_addresses: Vec<String>,
+    #[serde(default)]
+    pub lan_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +466,10 @@ pub struct QuickRegisterRequest {
     pub owner_email: Option<String>,
     #[serde(default)]
     pub personal_password: Option<String>,
+    #[serde(default)]
+    pub mac_addresses: Vec<String>,
+    #[serde(default)]
+    pub lan_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +527,10 @@ pub struct HeartbeatRequest {
     pub private_mem_mb: f64,
 }
 
+fn default_icon_kind() -> String {
+    "desktop".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceDto {
     pub id: Uuid,
@@ -342,9 +548,32 @@ pub struct DeviceDto {
     pub status: String,
     pub last_heartbeat_at: DateTime<Utc>,
     #[serde(default)]
+    pub group_id: Option<Uuid>,
+    #[serde(default)]
     pub owner_email: Option<String>,
     #[serde(default)]
     pub has_personal_password: bool,
+    #[serde(default = "default_icon_kind")]
+    pub icon_kind: String,
+    #[serde(default)]
+    pub accent_color: String,
+    #[serde(default)]
+    pub mac_addresses: Vec<String>,
+    #[serde(default)]
+    pub lan_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDeviceGroupRequest {
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDeviceAppearanceRequest {
+    pub icon_kind: String,
+    #[serde(default)]
+    pub accent_color: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +598,10 @@ pub struct AddressBookEntryDto {
     pub device_status: Option<String>,
     pub device_os: Option<String>,
     pub device_last_heartbeat: Option<DateTime<Utc>>,
+    #[serde(default = "default_icon_kind")]
+    pub icon_kind: String,
+    #[serde(default)]
+    pub accent_color: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +617,10 @@ pub struct UpsertAddressBookRequest {
     pub is_favorite: bool,
     pub notes: String,
     pub scheduled_next_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_icon_kind")]
+    pub icon_kind: String,
+    #[serde(default)]
+    pub accent_color: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +657,12 @@ pub struct SupportTicketDto {
     pub assigned_to: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveTicketRequest {
+    pub outcome: String,
+    pub resolution_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +768,10 @@ pub struct RmmCommandDto {
     pub created_at: DateTime<Utc>,
 }
 
+fn default_reasoning_effort() -> String {
+    "high".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettingsDto {
     pub provider: String,
@@ -537,6 +784,8 @@ pub struct AiSettingsDto {
     pub oauth_connected: bool,
     pub autonomy_level: String,
     pub redact_pii: bool,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,6 +800,8 @@ pub struct UpdateAiSettingsRequest {
     pub oauth_manual_token: Option<String>,
     pub autonomy_level: String,
     pub redact_pii: bool,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,6 +811,12 @@ pub struct AiChatRequest {
     pub prompt: String,
     pub include_diagnostics: bool,
     pub include_screenshot: bool,
+    #[serde(default)]
+    pub chat_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +837,34 @@ pub struct AiChatResponse {
     pub model_used: String,
     pub redacted_context_applied: bool,
     pub diagnostics_snapshot: Option<serde_json::Value>,
+    #[serde(default)]
+    pub chat_session_id: Option<Uuid>,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiChatMessageDto {
+    pub id: Uuid,
+    pub chat_session_id: Uuid,
+    pub device_id: Option<Uuid>,
+    pub prompt: String,
+    pub reply: String,
+    pub model_used: String,
+    pub reasoning_effort: String,
+    pub proposed_actions: Vec<AiProposedActionDto>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiChatSessionSummaryDto {
+    pub chat_session_id: Uuid,
+    pub device_id: Option<Uuid>,
+    pub title: String,
+    pub message_count: i64,
+    pub last_model: String,
+    pub last_reasoning_effort: String,
+    pub last_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,7 +976,7 @@ pub struct DeviceGroupDto {
     pub organization_id: Uuid,
     pub name: String,
     pub description: String,
-    pub owner_user_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
     pub owner_email: String,
     pub my_permission: String,
     pub device_count: i64,
@@ -701,6 +986,13 @@ pub struct DeviceGroupDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDeviceGroupRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDeviceGroupMetaRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -732,6 +1024,29 @@ pub struct AssignDeviceResponse {
     pub address_book_entry: Option<AddressBookEntryDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientLookupResponse {
+    pub exists: bool,
+    pub online: bool,
+    pub connection_id: String,
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WolRequest {
+    #[serde(default)]
+    pub mac_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WolResponse {
+    pub ok: bool,
+    pub mac_addresses: Vec<String>,
+    pub server_sent: usize,
+    pub relayed_agents: usize,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +1070,41 @@ mod tests {
                 assert_eq!(f.payload, vec![1, 2, 3, 4, 5]);
             }
             _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn extended_streaming_and_p2p_roundtrip() {
+        let samples = vec![
+            DataPacket::VideoFrame(VideoFrame {
+                seq: 7,
+                timestamp_ms: 99,
+                width: 1280,
+                height: 720,
+                encoding: FrameEncoding::HybridTiles,
+                payload: vec![0xA1, 0x01, 0x01, 0x00],
+            }),
+            DataPacket::Control(ControlMessage::FrameAck {
+                seq: 7,
+                decode_ms: 4,
+            }),
+            DataPacket::Control(ControlMessage::CursorUpdate {
+                x_norm: 0.5,
+                y_norm: 0.25,
+                visible: true,
+                shape: CursorShape::IBeam,
+            }),
+            DataPacket::Control(ControlMessage::P2pOffer {
+                session_nonce: [9u8; 16],
+                p2p_key: [7u8; 32],
+                endpoints: vec!["192.168.1.10:54321".into()],
+            }),
+        ];
+
+        for pkt in samples {
+            let raw = pkt.encode().unwrap();
+            let decoded = DataPacket::decode(&raw).unwrap();
+            assert_eq!(decoded.encode().unwrap(), raw);
         }
     }
 }

@@ -8,13 +8,17 @@ const BASE_CSS: &str = r#"
   --border: #242d3f;
   --text: #e6edf7;
   --muted: #8b9bb4;
-  --primary: #3b82f6;
-  --primary-hover: #2563eb;
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --err: #ef4444;
-  --radius: 8px;
-  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --link: #60a5fa;
+  --focus: #60a5fa;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --err: #f87171;
+  --danger-bg: rgba(248,113,113,.14);
+  --danger-border: rgba(248,113,113,.42);
+  --radius: 12px;
+  --font: Inter, 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
 [data-theme="light"] {
   --bg: #f6f8fb;
@@ -23,32 +27,49 @@ const BASE_CSS: &str = r#"
   --border: #d8e0ec;
   --text: #0f172a;
   --muted: #475569;
+  --primary: #1d4ed8;
+  --primary-hover: #1e40af;
+  --link: #1d4ed8;
+  --focus: #1d4ed8;
+  --ok: #166534;
+  --warn: #92400e;
+  --err: #b91c1c;
+  --danger-bg: rgba(185,28,28,.08);
+  --danger-border: rgba(185,28,28,.35);
 }
 * { box-sizing: border-box; }
-body { margin: 0; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; }
-a { color: var(--primary); text-decoration: none; }
+html { color-scheme: dark; }
+html[data-theme="light"] { color-scheme: light; }
+body { margin: 0; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.55; text-rendering: optimizeLegibility; }
+a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
-.nav { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.nav { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 20; backdrop-filter: blur(12px); }
 .brand { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 8px; color: var(--text); }
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); }
 .badge.ok { color: var(--ok); border-color: rgba(34,197,94,.35); }
 .badge.off { color: var(--muted); }
 .badge.warn { color: var(--warn); border-color: rgba(245,158,11,.35); }
-.btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; font-size: 13px; font-weight: 500; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; font: inherit; font-size: 13px; font-weight: 600; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
 .btn:hover { border-color: var(--primary); text-decoration: none; }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.primary:hover { background: var(--primary-hover); }
-.btn.danger { background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.4); color: #fca5a5; }
-.container { max-width: 1120px; margin: 0 auto; padding: 28px 20px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn.danger { background: var(--danger-bg); border-color: var(--danger-border); color: var(--err); }
+.container { max-width: 1240px; margin: 0 auto; padding: 32px 24px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: 0 8px 28px rgba(0,0,0,.08); }
 .grid { display: grid; gap: 14px; }
 .grid-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .grid-4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
-input, select, textarea { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-family: inherit; font-size: 13px; }
+input, select, textarea { width: 100%; min-height: 38px; padding: 8px 11px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-family: inherit; font-size: 13px; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+input:disabled, select:disabled, textarea:disabled { opacity: .6; cursor: not-allowed; }
+.device-group-select { width: auto; min-width: 140px; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
 .field { margin-bottom: 12px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+section.card { overflow-x: auto; }
+table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 tr:hover td { background: rgba(59,130,246,.04); }
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
@@ -64,6 +85,7 @@ tr:hover td { background: rgba(59,130,246,.04); }
 .dd-sep { height: 1px; background: var(--border); margin: 6px 0; }
 .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); align-items: center; justify-content: center; z-index: 60; }
 .modal-backdrop.open { display: flex; }
+@media(max-width:640px){ .nav { padding:10px 14px; align-items:flex-start; gap:10px; flex-direction:column; } .container { padding:20px 14px; } .card { padding:16px; } }
 "#;
 
 fn shell(title: &str, body: &str) -> Html<String> {
@@ -166,13 +188,13 @@ pub async fn support_page() -> Html<String> {
     <section class="card">
       <h2 style="margin-top:0;">Solicitar asistencia remota</h2>
       <form id="sup-form">
-        <div class="field"><label>Nombre</label><input id="name" required placeholder="Juan Pérez"/></div>
-        <div class="field"><label>Contacto (email o teléfono)</label><input id="contact" required placeholder="juan@empresa.com"/></div>
-        <div class="field"><label>Empresa (opcional)</label><input id="company" placeholder="Acme S.A."/></div>
-        <div class="field"><label>Categoría</label>
+        <div class="field"><label for="name">Nombre</label><input id="name" required placeholder="Juan Pérez"/></div>
+        <div class="field"><label for="contact">Contacto (email o teléfono)</label><input id="contact" required placeholder="juan@empresa.com"/></div>
+        <div class="field"><label for="company">Empresa (opcional)</label><input id="company" placeholder="Acme S.A."/></div>
+        <div class="field"><label for="category">Categoría</label>
           <select id="category"><option>Soporte General</option><option>Acceso / Red</option><option>Urgente</option></select>
         </div>
-        <div class="field"><label>Descripción del problema</label><textarea id="desc" rows="3" required placeholder="Describe qué ocurre..."></textarea></div>
+        <div class="field"><label for="desc">Descripción del problema</label><textarea id="desc" rows="3" required placeholder="Describe qué ocurre..."></textarea></div>
         <div class="field row">
           <input id="consent" type="checkbox" style="width:auto;" required />
           <label for="consent" style="margin:0;">Acepto el tratamiento de datos y el inicio consentido de la sesión de soporte.</label>
@@ -236,12 +258,12 @@ pub async fn setup_page() -> Html<String> {
     <h2 style="margin-top:0;">Asistente de primer inicio</h2>
     <p class="muted">Crea la organización principal y el primer administrador usando el token de bootstrap impreso en la consola del servidor.</p>
     <form id="setup-form">
-      <div class="field"><label>Organización</label><input id="org_name" required value="Mi Empresa"/></div>
-      <div class="field"><label>Slug</label><input id="org_slug" required value="mi-empresa"/></div>
-      <div class="field"><label>Nombre Administrador</label><input id="admin_name" required value="Administrador"/></div>
-      <div class="field"><label>Email</label><input id="admin_email" type="email" required value="juan@dolan.com.ar"/></div>
-      <div class="field"><label>Contraseña (mín. 8 caracteres)</label><input id="admin_pw" type="password" required/></div>
-      <div class="field"><label>Bootstrap Token</label><input id="boot_tok" required placeholder="Token de un solo uso"/></div>
+      <div class="field"><label for="org_name">Organización</label><input id="org_name" required value="Mi Empresa"/></div>
+      <div class="field"><label for="org_slug">Slug</label><input id="org_slug" required value="mi-empresa"/></div>
+      <div class="field"><label for="admin_name">Nombre Administrador</label><input id="admin_name" required value="Administrador"/></div>
+      <div class="field"><label for="admin_email">Email</label><input id="admin_email" type="email" required value="juan@dolan.com.ar"/></div>
+      <div class="field"><label for="admin_pw">Contraseña (mín. 8 caracteres)</label><input id="admin_pw" type="password" required/></div>
+      <div class="field"><label for="boot_tok">Bootstrap Token</label><input id="boot_tok" required placeholder="Token de un solo uso"/></div>
       <div id="err" class="muted" style="color:var(--err);margin-bottom:8px;"></div>
       <button class="btn primary" type="submit">Inicializar servidor</button>
     </form>
@@ -276,8 +298,9 @@ pub async fn login_page() -> Html<String> {
   <div class="card">
     <h2 style="margin-top:0;">Iniciar sesión en AgentDesk</h2>
     <form id="login-form">
-      <div class="field"><label>Email</label><input id="email" type="email" required/></div>
-      <div class="field"><label>Contraseña</label><input id="pw" type="password" required/></div>
+      <div class="field"><label for="email">Email</label><input id="email" type="email" required/></div>
+      <div class="field"><label for="pw">Contraseña</label><input id="pw" type="password" required/></div>
+      <div class="field"><label for="totp">Código MFA (si está activado)</label><input id="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000"/></div>
       <div id="err" style="color:var(--err);margin-bottom:8px;"></div>
       <div class="row" style="justify-content:space-between;">
         <button class="btn primary" type="submit">Entrar</button>
@@ -291,10 +314,14 @@ pub async fn login_page() -> Html<String> {
     e.preventDefault();
     const res=await fetch('/api/v1/auth/login',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({email:email.value,password:pw.value})
+      body:JSON.stringify({email:email.value,password:pw.value,totp_code:totp.value||null})
     });
     const d=await res.json();
-    if(!res.ok){ err.textContent=d.error||'Credenciales inválidas'; return; }
+    if(!res.ok){
+      err.textContent=d.error==='mfa_code_required'?'Esta cuenta requiere el código MFA de 6 dígitos.':
+        d.error==='invalid_mfa_code'?'El código MFA no es válido.':(d.error||'Credenciales inválidas');
+      return;
+    }
     location.href='/app';
   };
   </script>
@@ -354,7 +381,7 @@ pub async fn app_dashboard_page() -> Html<String> {
               <div id="dd-email" class="muted" style="font-size:12px;">-</div>
             </div>
             <div class="dd-sep"></div>
-            <button class="dd-item" id="theme-btn" type="button"><span>Tema</span><span id="theme-label" class="badge">Dracula Oscuro</span></button>
+            <button class="dd-item" id="theme-btn" type="button"><span>Tema</span><span id="theme-label" class="badge">Oscuro</span></button>
             <button class="dd-item" id="open-pw-btn" type="button"><span>Cambiar contraseña</span><span>🔑</span></button>
             <div class="dd-sep"></div>
             <button class="dd-item" id="logout-btn" type="button" style="color:var(--err);"><span>Cerrar sesión</span><span>⎋</span></button>
@@ -377,14 +404,14 @@ pub async fn app_dashboard_page() -> Html<String> {
         </div>
         <form id="agenda-form" class="card" style="display:none;margin-bottom:14px;background:var(--surface-2);">
           <div class="grid grid-3">
-            <div class="field"><label>Alias / Equipo</label><input id="ag-alias" required placeholder="PC Caja 01"/></div>
-            <div class="field"><label>Empresa cliente</label><input id="ag-company" placeholder="Cliente Norte S.A."/></div>
-            <div class="field"><label>Contacto</label><input id="ag-contact" placeholder="María Gómez"/></div>
-            <div class="field"><label>Grupo compartido</label><select id="ag-group-id"><option value="">General (sin grupo)</option></select></div>
-            <div class="field"><label>Vincular equipo (opcional)</label><select id="ag-device"><option value="">Sin vincular</option></select></div>
-            <div class="field"><label>Próxima cita (opcional)</label><input id="ag-sched" type="datetime-local"/></div>
+            <div class="field"><label for="ag-alias">Alias / Equipo</label><input id="ag-alias" required placeholder="PC Caja 01"/></div>
+            <div class="field"><label for="ag-company">Empresa cliente</label><input id="ag-company" placeholder="Cliente Norte S.A."/></div>
+            <div class="field"><label for="ag-contact">Contacto</label><input id="ag-contact" placeholder="María Gómez"/></div>
+            <div class="field"><label for="ag-group-id">Grupo compartido</label><select id="ag-group-id"><option value="">General (sin grupo)</option></select></div>
+            <div class="field"><label for="ag-device">Vincular equipo (opcional)</label><select id="ag-device"><option value="">Sin vincular</option></select></div>
+            <div class="field"><label for="ag-sched">Próxima cita (opcional)</label><input id="ag-sched" type="datetime-local"/></div>
           </div>
-          <div class="field"><label>Notas</label><input id="ag-notes" placeholder="Horario mantenimiento, detalles"/></div>
+          <div class="field"><label for="ag-notes">Notas</label><input id="ag-notes" placeholder="Horario mantenimiento, detalles"/></div>
           <button class="btn primary" type="submit">Guardar cliente</button>
         </form>
         <table><thead><tr><th>Fav</th><th>Alias</th><th>Empresa / Contacto</th><th>Grupo</th><th>Equipo vinculado</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="agenda-body"></tbody></table>
@@ -396,8 +423,8 @@ pub async fn app_dashboard_page() -> Html<String> {
         </div>
         <form id="group-form" class="card" style="margin-bottom:14px;background:var(--surface-2);">
           <div class="grid grid-3">
-            <div class="field"><label>Nombre del grupo</label><input id="grp-name" required placeholder="Sucursal Centro / VIP"/></div>
-            <div class="field"><label>Descripción</label><input id="grp-desc" placeholder="Servidores y cajas"/></div>
+            <div class="field"><label for="grp-name">Nombre del grupo</label><input id="grp-name" required placeholder="Sucursal Centro / VIP"/></div>
+            <div class="field"><label for="grp-desc">Descripción</label><input id="grp-desc" placeholder="Servidores y cajas"/></div>
             <div class="field" style="display:flex;align-items:flex-end;"><button class="btn primary" type="submit">+ Crear grupo</button></div>
           </div>
         </form>
@@ -411,10 +438,10 @@ pub async fn app_dashboard_page() -> Html<String> {
         </div>
         <form id="assign-form" class="card" style="margin-bottom:12px;background:var(--surface-2);">
           <div class="grid grid-4">
-            <div class="field"><label>ID de Conexión (9 dígitos)</label><input id="as-code" required placeholder="123 456 789"/></div>
-            <div class="field"><label>Email usuario registrado (opcional)</label><input id="as-email" type="email" placeholder="tecnico@empresa.com"/></div>
-            <div class="field"><label>Grupo (opcional)</label><select id="as-group"><option value="">Sin grupo</option></select></div>
-            <div class="field"><label>Alias agenda (opcional)</label><input id="as-alias" placeholder="PC Recepción"/></div>
+            <div class="field"><label for="as-code">ID de Conexión (9 dígitos)</label><input id="as-code" required placeholder="123 456 789"/></div>
+            <div class="field"><label for="as-email">Email usuario registrado (opcional)</label><input id="as-email" type="email" placeholder="tecnico@empresa.com"/></div>
+            <div class="field"><label for="as-group">Grupo (opcional)</label><select id="as-group"><option value="">Sin grupo</option></select></div>
+            <div class="field"><label for="as-alias">Alias agenda (opcional)</label><input id="as-alias" placeholder="PC Recepción"/></div>
           </div>
           <div class="row">
             <button class="btn primary" type="submit">Registrar / Asignar equipo</button>
@@ -422,7 +449,7 @@ pub async fn app_dashboard_page() -> Html<String> {
           </div>
         </form>
         <div id="enroll-out" class="mono card" style="display:none;margin-bottom:12px;background:var(--surface-2);"></div>
-        <table><thead><tr><th>Código</th><th>Hostname</th><th>Tipo</th><th>Propietario</th><th>SO / Res</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="devices-body"></tbody></table>
+        <table><thead><tr><th>Código</th><th>Hostname</th><th>Tipo</th><th>Grupo</th><th>Propietario</th><th>SO / Res</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="devices-body"></tbody></table>
       </section>
 
       <section id="tab-tickets" class="card" style="display:none;">
@@ -441,8 +468,8 @@ pub async fn app_dashboard_page() -> Html<String> {
   <div class="card" style="width:100%;max-width:400px;">
     <h3 style="margin-top:0;">Cambiar contraseña</h3>
     <form id="pw-form">
-      <div class="field"><label>Contraseña actual</label><input id="pw-cur" type="password" required/></div>
-      <div class="field"><label>Nueva contraseña (mín. 6)</label><input id="pw-new" type="password" required minlength="6"/></div>
+      <div class="field"><label for="pw-cur">Contraseña actual</label><input id="pw-cur" type="password" required/></div>
+      <div class="field"><label for="pw-new">Nueva contraseña (mín. 6)</label><input id="pw-new" type="password" required minlength="6"/></div>
       <div id="pw-err" style="color:var(--err);margin-bottom:8px;"></div>
       <div class="row" style="justify-content:flex-end;">
         <button class="btn" type="button" id="close-pw-btn">Cancelar</button>
@@ -451,16 +478,37 @@ pub async fn app_dashboard_page() -> Html<String> {
     </form>
   </div>
 </div>
+<div id="ticket-resolve-modal" class="modal-backdrop">
+  <form class="card" id="ticket-resolve-form" style="width:100%;max-width:560px;">
+    <h3 style="margin-top:0;">Resolver solicitud</h3>
+    <div id="ticket-resolve-code" class="muted" style="margin-bottom:12px;"></div>
+    <div class="field"><label for="ticket-outcome">Resultado</label><select id="ticket-outcome"><option value="resolved">Resuelto</option><option value="partial">Resolución parcial</option><option value="unresolved">Sin solución</option></select></div>
+    <div class="field"><label for="ticket-resolution-summary">Resumen de diagnóstico y resolución</label><textarea id="ticket-resolution-summary" required maxlength="4000" rows="5" placeholder="Qué se diagnosticó, qué se hizo y qué queda pendiente"></textarea></div>
+    <div id="ticket-resolve-error" role="alert" style="color:var(--err);margin-bottom:10px;"></div>
+    <div class="row" style="justify-content:flex-end;"><button class="btn" id="cancel-ticket-resolve" type="button">Cancelar</button><button class="btn primary" type="submit">Guardar resolución y cerrar</button></div>
+  </form>
+</div>
+<div id="ticket-history-modal" class="modal-backdrop">
+  <div class="card" style="width:100%;max-width:700px;max-height:80vh;overflow:auto;">
+    <div class="row" style="justify-content:space-between;"><h3 style="margin-top:0;">Historial del ticket</h3><button class="btn" id="close-ticket-history" type="button" aria-label="Cerrar historial">×</button></div>
+    <div id="ticket-history-body" aria-live="polite"></div>
+  </div>
+</div>
 <script>
 let state={devices:[],agenda:[],groups:[],tickets:[],sessions:[],audit:[]};
+let resolvingTicketId=null;
 document.addEventListener('keydown',(e)=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();document.getElementById('global-search').focus();}});
 const dd=document.getElementById('user-dropdown');
 document.getElementById('user-menu-btn').onclick=(e)=>{e.stopPropagation();dd.classList.toggle('open');};
 document.addEventListener('click',()=>dd.classList.remove('open'));
+const savedTheme=localStorage.getItem('agentdesk-theme');
+if(savedTheme==='light')document.documentElement.dataset.theme='light';
+document.getElementById('theme-label').textContent=savedTheme==='light'?'Claro':'Oscuro';
 document.getElementById('theme-btn').onclick=()=>{
   const isLight=document.documentElement.dataset.theme==='light';
   document.documentElement.dataset.theme=isLight?'':'light';
-  document.getElementById('theme-label').textContent=isLight?'Dracula Oscuro':'OpenVMS Claro';
+  localStorage.setItem('agentdesk-theme',isLight?'dark':'light');
+  document.getElementById('theme-label').textContent=isLight?'Oscuro':'Claro';
 };
 document.getElementById('logout-btn').onclick=async()=>{await fetch('/api/v1/auth/logout',{method:'POST'});location.href='/login';};
 document.getElementById('open-pw-btn').onclick=()=>{dd.classList.remove('open');document.getElementById('pw-modal').classList.add('open');};
@@ -480,6 +528,25 @@ document.querySelectorAll('.nav-item[data-tab]').forEach(el=>el.onclick=()=>{
 document.getElementById('toggle-add-agenda').onclick=()=>{const f=document.getElementById('agenda-form');f.style.display=f.style.display==='none'?'block':'none';};
 
 async function api(url,opts){const r=await fetch(url,opts);if(r.status===401){location.href='/login';throw new Error('401');}return r.json();}
+
+async function updateDeviceGroup(select){
+  const deviceId=select.dataset.deviceId;
+  const device=state.devices.find(d=>d.id===deviceId);
+  if(!device)return;
+  const status=select.nextElementSibling;
+  const previous=device.group_id||'';
+  const groupId=select.value||null;
+  select.disabled=true;status.textContent='Guardando…';
+  try{
+    const response=await fetch(`/api/v1/devices/${deviceId}/group`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_id:groupId})});
+    const body=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);
+    device.group_id=groupId;status.textContent='Guardado';
+    await loadAll();
+  }catch(error){
+    device.group_id=previous||null;select.value=previous;status.textContent=`No se pudo guardar: ${error.message}`;select.disabled=false;
+  }
+}
 
 async function loadAll(){
   const me=await api('/api/v1/auth/me');
@@ -539,16 +606,25 @@ function render(){
       </td>
     </tr>`).join('');
 
-  document.getElementById('devices-body').innerHTML=state.devices.filter(d=>!q||JSON.stringify(d).toLowerCase().includes(q)).map(d=>`
+  document.getElementById('devices-body').innerHTML=state.devices.filter(d=>!q||JSON.stringify(d).toLowerCase().includes(q)).map(d=>{
+    const assignedGroup=state.groups.find(g=>g.id===d.group_id);
+    const writableGroups=state.groups.filter(g=>g.my_permission==='full_control'||g.my_permission==='read_write');
+    const canChangeGroup=(!d.group_id&&writableGroups.length>0)||(assignedGroup&&(assignedGroup.my_permission==='full_control'||assignedGroup.my_permission==='read_write'));
+    const groupOptions=`<option value="" ${!d.group_id?'selected':''}>Sin grupo</option>`+
+      (d.group_id&&!assignedGroup?'<option value="" selected disabled>Grupo restringido</option>':'')+
+      writableGroups.map(g=>`<option value="${g.id}" ${d.group_id===g.id?'selected':''}>${g.name}</option>`).join('');
+    return `
     <tr>
       <td class="mono">${d.public_code}</td>
       <td><strong>${d.hostname}</strong></td>
       <td><span class="badge">${d.kind}</span>${d.has_personal_password?' <span class="badge ok">Pass fija</span>':''}</td>
+      <td><select class="device-group-select" data-device-id="${d.id}" onchange="updateDeviceGroup(this)" ${canChangeGroup?'':'disabled'}>${groupOptions}</select><span class="muted" aria-live="polite"></span></td>
       <td class="mono">${d.owner_email||'<span class="muted">Sin asignar</span>'}</td>
       <td>${d.os_name} (${d.screen_width}x${d.screen_height})</td>
       <td><span class="badge ${d.status==='online'?'ok':'off'}">${d.status}</span></td>
       <td><a class="btn primary" href="agentdesk://connect/${d.id}">Conectar</a></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 
   document.getElementById('tickets-body').innerHTML=state.tickets.filter(t=>!q||JSON.stringify(t).toLowerCase().includes(q)).map(t=>`
     <tr>
@@ -560,7 +636,7 @@ function render(){
       <td class="row">
         ${t.status==='queued'?`<button class="btn primary" onclick="claimTicket('${t.id}')">Reclamar</button>`:''}
         ${t.device_id?`<a class="btn primary" href="agentdesk://connect/${t.device_id}">Conectar</a>`:''}
-        ${t.status!=='closed'?`<button class="btn" onclick="closeTicket('${t.id}')">Cerrar</button>`:''}
+        ${t.status!=='closed'?`<button class="btn" onclick="closeTicket('${t.id}','${t.public_code}')">Resolver y cerrar</button>`:`<button class="btn" onclick="openTicketHistory('${t.id}')">Historial</button>`}
       </td>
     </tr>`).join('');
 
@@ -615,7 +691,48 @@ async function unshareGroup(gid,uid){await api('/api/v1/groups/'+gid+'/shares/'+
 async function delGroup(id){await api('/api/v1/groups/'+id,{method:'DELETE'});loadAll();}
 async function delAgenda(id){await api('/api/v1/address-book/'+id,{method:'DELETE'});loadAll();}
 async function claimTicket(id){await api('/api/v1/tickets/'+id+'/claim',{method:'POST'});loadAll();}
-async function closeTicket(id){await api('/api/v1/tickets/'+id+'/close',{method:'POST'});loadAll();}
+function closeTicket(id,code){
+  resolvingTicketId=id;
+  document.getElementById('ticket-resolve-code').textContent=code||'';
+  document.getElementById('ticket-resolution-summary').value='';
+  document.getElementById('ticket-resolve-error').textContent='';
+  document.getElementById('ticket-resolve-modal').classList.add('open');
+  document.getElementById('ticket-outcome').focus();
+}
+document.getElementById('cancel-ticket-resolve').onclick=()=>{resolvingTicketId=null;document.getElementById('ticket-resolve-modal').classList.remove('open');};
+document.getElementById('ticket-resolve-form').onsubmit=async(e)=>{
+  e.preventDefault();
+  if(!resolvingTicketId)return;
+  const button=e.target.querySelector('[type="submit"]');button.disabled=true;
+  document.getElementById('ticket-resolve-error').textContent='Guardando resolución…';
+  try{
+    const response=await fetch('/api/v1/tickets/'+resolvingTicketId+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({outcome:document.getElementById('ticket-outcome').value,resolution_summary:document.getElementById('ticket-resolution-summary').value})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);
+    document.getElementById('ticket-resolve-modal').classList.remove('open');
+    resolvingTicketId=null;e.target.reset();await loadAll();
+  }catch(error){document.getElementById('ticket-resolve-error').textContent=`No se pudo cerrar: ${error.message}`;}
+  finally{button.disabled=false;}
+};
+async function openTicketHistory(id){
+  const body=document.getElementById('ticket-history-body');body.replaceChildren();
+  const modal=document.getElementById('ticket-history-modal');modal.classList.add('open');
+  const loading=document.createElement('p');loading.className='muted';loading.textContent='Cargando historial…';body.append(loading);
+  try{
+    const comments=await api('/api/v1/tickets/'+id+'/comments');body.replaceChildren();
+    if(!comments.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='Todavía no hay comentarios registrados.';body.append(empty);return;}
+    for(const comment of comments){
+      const card=document.createElement('article');card.className='card';card.style.marginBottom='10px';
+      const header=document.createElement('div');header.className='row';
+      const author=document.createElement('strong');author.textContent=comment.author_name;header.append(author);
+      if(comment.is_internal){const badge=document.createElement('span');badge.className='badge warn';badge.textContent='Nota interna';header.append(badge);}
+      const date=document.createElement('span');date.className='muted';date.textContent=new Date(comment.created_at).toLocaleString();header.append(date);
+      const text=document.createElement('p');text.style.whiteSpace='pre-wrap';text.textContent=comment.body;
+      card.append(header,text);body.append(card);
+    }
+  }catch(error){body.replaceChildren();const message=document.createElement('p');message.setAttribute('role','alert');message.style.color='var(--err)';message.textContent=`No se pudo cargar el historial: ${error.message}`;body.append(message);}
+}
+document.getElementById('close-ticket-history').onclick=()=>document.getElementById('ticket-history-modal').classList.remove('open');
 document.getElementById('new-enroll-btn').onclick=async()=>{
   const r=await api('/api/v1/enrollments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:'Enrolamiento Host',max_uses:25,expires_hours:72})});
   const out=document.getElementById('enroll-out');
@@ -624,7 +741,7 @@ document.getElementById('new-enroll-btn').onclick=async()=>{
 };
 loadAll();
 const es=new EventSource('/api/v1/events');
-['device.online','device.offline','device.enrolled','support.created','ticket.assigned','session.started'].forEach(ev=>es.addEventListener(ev,()=>loadAll()));
+['device.online','device.offline','device.enrolled','support.created','ticket.assigned','ticket.closed','session.started'].forEach(ev=>es.addEventListener(ev,()=>loadAll()));
 </script>
 </body>
 </html>"#;

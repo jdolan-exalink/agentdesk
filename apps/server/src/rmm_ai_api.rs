@@ -1,15 +1,20 @@
 use crate::auth::AuthContext;
 use crate::state::{record_audit, ApiError, AppState};
 use agentdesk_ai::{
-    ask_copilot, build_oauth_authorize_url, exchange_oauth_code, generate_pkce, AiAutonomyLevel,
-    AiConfig, AiProviderKind, CopilotRequest,
+    ask_copilot, build_oauth_authorize_url, exchange_device_auth_code, exchange_oauth_code,
+    generate_pkce, is_legacy_or_internal_model, jwt_is_expired_or_soon, list_available_models,
+    normalize_reasoning_effort, pick_default_luna_model, poll_device_auth, refresh_oauth_token,
+    start_device_auth, AiAutonomyLevel, AiConfig, AiProviderKind, ChatHistoryTurn, CopilotRequest,
+    DeviceAuthPoll, OPENCODE_OAUTH_AUTH_URL, OPENCODE_OAUTH_CLIENT_ID, OPENCODE_OAUTH_REDIRECT_URI,
+    OPENCODE_OAUTH_TOKEN_URL,
 };
 use agentdesk_identity::hash_password;
 use agentdesk_protocol::{
-    AiChatRequest, AiChatResponse, AiExecuteActionRequest, AiProposedActionDto, AiSettingsDto,
-    CalendarEventDto, CreateCalendarEventRequest, CreateTicketCommentRequest, CreateUserRequest,
-    DocPageDto, MfaSetupResponse, MfaVerifyRequest, RmmCommandDto, RunCommandRequest,
-    RunDiagnosticRequest, ServerToAgentMessage, TicketCommentDto, UpdateAiSettingsRequest, UserDto,
+    AiChatMessageDto, AiChatRequest, AiChatResponse, AiChatSessionSummaryDto,
+    AiExecuteActionRequest, AiProposedActionDto, AiSettingsDto, CalendarEventDto,
+    CreateCalendarEventRequest, CreateTicketCommentRequest, CreateUserRequest, DocPageDto,
+    MfaSetupResponse, MfaVerifyRequest, RmmCommandDto, RunCommandRequest, RunDiagnosticRequest,
+    ServerToAgentMessage, TicketCommentDto, UpdateAiSettingsRequest, UserDto,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -19,10 +24,11 @@ use chrono::{DateTime, Utc};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::Sha1;
 use sqlx::Row;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -37,6 +43,29 @@ const ALLOWED_ROLES: [&str; 7] = [
     "auditor",
     "client",
 ];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RmmAlertThresholds {
+    pub cpu_warning_pct: f64,
+    pub cpu_critical_pct: f64,
+    pub ram_warning_pct: f64,
+    pub ram_critical_pct: f64,
+    pub disk_free_warning_pct: f64,
+    pub disk_free_critical_pct: f64,
+}
+
+impl Default for RmmAlertThresholds {
+    fn default() -> Self {
+        Self {
+            cpu_warning_pct: 85.0,
+            cpu_critical_pct: 95.0,
+            ram_warning_pct: 85.0,
+            ram_critical_pct: 95.0,
+            disk_free_warning_pct: 15.0,
+            disk_free_critical_pct: 5.0,
+        }
+    }
+}
 
 fn compute_totp_at(secret_b32: &str, counter: u64) -> Result<String, ApiError> {
     let key = BASE32_NOPAD
@@ -111,7 +140,9 @@ pub async fn create_user(
         return Err(ApiError::bad_request("invalid RBAC role"));
     }
     if req.password.len() < 8 {
-        return Err(ApiError::bad_request("password must be at least 8 characters"));
+        return Err(ApiError::bad_request(
+            "password must be at least 8 characters",
+        ));
     }
     let uid = Uuid::new_v4();
     let pw_hash = hash_password(&req.password).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -232,6 +263,383 @@ pub async fn mfa_verify(
 // RMM Diagnostics & Remote Shell Terminal (RMM-01..03)
 // ---------------------------------------------------------------------------
 
+async fn load_rmm_alert_thresholds(
+    state: &AppState,
+    organization_id: Uuid,
+) -> Result<RmmAlertThresholds, ApiError> {
+    let row = sqlx::query(
+        "SELECT cpu_warning_pct, cpu_critical_pct, ram_warning_pct, ram_critical_pct,
+                disk_free_warning_pct, disk_free_critical_pct
+         FROM rmm_alert_settings WHERE organization_id = $1",
+    )
+    .bind(organization_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(row
+        .map(|row| RmmAlertThresholds {
+            cpu_warning_pct: row.get("cpu_warning_pct"),
+            cpu_critical_pct: row.get("cpu_critical_pct"),
+            ram_warning_pct: row.get("ram_warning_pct"),
+            ram_critical_pct: row.get("ram_critical_pct"),
+            disk_free_warning_pct: row.get("disk_free_warning_pct"),
+            disk_free_critical_pct: row.get("disk_free_critical_pct"),
+        })
+        .unwrap_or_default())
+}
+
+pub async fn get_rmm_alert_settings(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<RmmAlertThresholds>, ApiError> {
+    Ok(Json(
+        load_rmm_alert_thresholds(&state, auth.user.organization_id).await?,
+    ))
+}
+
+pub async fn update_rmm_alert_settings(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(settings): Json<RmmAlertThresholds>,
+) -> Result<Json<RmmAlertThresholds>, ApiError> {
+    if !crate::state::is_admin_role(&auth.user.role) {
+        return Err(ApiError::forbidden(
+            "only organization administrators can change RMM alert thresholds",
+        ));
+    }
+    let values = [
+        settings.cpu_warning_pct,
+        settings.cpu_critical_pct,
+        settings.ram_warning_pct,
+        settings.ram_critical_pct,
+        settings.disk_free_warning_pct,
+        settings.disk_free_critical_pct,
+    ];
+    if values.iter().any(|value| !value.is_finite())
+        || settings.cpu_warning_pct <= 0.0
+        || settings.cpu_warning_pct >= settings.cpu_critical_pct
+        || settings.cpu_critical_pct > 100.0
+        || settings.ram_warning_pct <= 0.0
+        || settings.ram_warning_pct >= settings.ram_critical_pct
+        || settings.ram_critical_pct > 100.0
+        || settings.disk_free_critical_pct < 0.0
+        || settings.disk_free_critical_pct >= settings.disk_free_warning_pct
+        || settings.disk_free_warning_pct > 100.0
+    {
+        return Err(ApiError::bad_request("thresholds must be finite percentages with warning below critical for CPU/RAM and critical below warning for free disk space"));
+    }
+
+    sqlx::query(
+        "INSERT INTO rmm_alert_settings (
+             organization_id, cpu_warning_pct, cpu_critical_pct, ram_warning_pct,
+             ram_critical_pct, disk_free_warning_pct, disk_free_critical_pct, updated_by, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         ON CONFLICT (organization_id) DO UPDATE SET
+             cpu_warning_pct = EXCLUDED.cpu_warning_pct,
+             cpu_critical_pct = EXCLUDED.cpu_critical_pct,
+             ram_warning_pct = EXCLUDED.ram_warning_pct,
+             ram_critical_pct = EXCLUDED.ram_critical_pct,
+             disk_free_warning_pct = EXCLUDED.disk_free_warning_pct,
+             disk_free_critical_pct = EXCLUDED.disk_free_critical_pct,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = now()",
+    )
+    .bind(auth.user.organization_id)
+    .bind(settings.cpu_warning_pct)
+    .bind(settings.cpu_critical_pct)
+    .bind(settings.ram_warning_pct)
+    .bind(settings.ram_critical_pct)
+    .bind(settings.disk_free_warning_pct)
+    .bind(settings.disk_free_critical_pct)
+    .bind(auth.user.id)
+    .execute(&state.pool)
+    .await?;
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "rmm.alert_thresholds_updated",
+        "rmm_alert_settings",
+        &auth.user.organization_id.to_string(),
+        "success",
+        json!(settings),
+    )
+    .await;
+    Ok(Json(settings))
+}
+
+async fn sync_metric_alert(
+    state: &AppState,
+    organization_id: Uuid,
+    device_id: Uuid,
+    actor_id: Option<Uuid>,
+    fingerprint: &str,
+    label: &str,
+    current_value: f64,
+    warning_threshold: f64,
+    critical_threshold: f64,
+    high_is_bad: bool,
+) -> Result<(), ApiError> {
+    let breached = if high_is_bad {
+        current_value >= warning_threshold
+    } else {
+        current_value <= warning_threshold
+    };
+
+    if !breached {
+        let resolved = sqlx::query(
+            "UPDATE device_alerts SET status = 'resolved', resolved_at = now(), updated_at = now()
+             WHERE organization_id = $1 AND device_id = $2 AND fingerprint = $3
+               AND status IN ('open', 'acknowledged')
+             RETURNING id",
+        )
+        .bind(organization_id)
+        .bind(device_id)
+        .bind(fingerprint)
+        .fetch_optional(&state.pool)
+        .await?;
+        if let Some(row) = resolved {
+            let alert_id: Uuid = row.get("id");
+            record_audit(
+                &state.pool,
+                Some(organization_id),
+                actor_id,
+                if actor_id.is_some() { "user" } else { "system" },
+                "rmm.alert_resolved",
+                "device_alert",
+                &alert_id.to_string(),
+                "success",
+                json!({ "device_id": device_id, "fingerprint": fingerprint }),
+            )
+            .await;
+            state.emit_event(
+                "device.alert_resolved",
+                organization_id,
+                alert_id.to_string(),
+                format!("Alerta de {label} resuelta en el equipo {device_id}"),
+            );
+        }
+        return Ok(());
+    }
+
+    let critical = if high_is_bad {
+        current_value >= critical_threshold
+    } else {
+        current_value <= critical_threshold
+    };
+    let severity = if critical { "critical" } else { "warning" };
+    let threshold = if critical {
+        critical_threshold
+    } else {
+        warning_threshold
+    };
+    let comparison = if high_is_bad {
+        "supera"
+    } else {
+        "está por debajo de"
+    };
+    let summary =
+        format!("{label} {comparison} el umbral: {current_value:.1}% (umbral {threshold:.0}%)");
+    let row = sqlx::query(
+        "INSERT INTO device_alerts (
+             id, organization_id, device_id, fingerprint, severity, status, summary,
+             current_value, threshold, unit
+         ) VALUES ($1, $2, $3, $4, $5, 'open', $6, $7, $8, '%')
+         ON CONFLICT (device_id, fingerprint) WHERE status IN ('open', 'acknowledged')
+         DO UPDATE SET severity = EXCLUDED.severity, summary = EXCLUDED.summary,
+             current_value = EXCLUDED.current_value, threshold = EXCLUDED.threshold,
+             last_seen_at = now(), occurrence_count = device_alerts.occurrence_count + 1,
+             updated_at = now()
+         RETURNING id, (xmax = 0) AS inserted",
+    )
+    .bind(Uuid::new_v4())
+    .bind(organization_id)
+    .bind(device_id)
+    .bind(fingerprint)
+    .bind(severity)
+    .bind(&summary)
+    .bind(current_value)
+    .bind(threshold)
+    .fetch_one(&state.pool)
+    .await?;
+    let alert_id: Uuid = row.get("id");
+    let inserted: bool = row.get("inserted");
+    if inserted {
+        record_audit(
+            &state.pool,
+            Some(organization_id),
+            actor_id,
+            if actor_id.is_some() { "user" } else { "system" },
+            "rmm.alert_opened",
+            "device_alert",
+            &alert_id.to_string(),
+            "success",
+            json!({ "device_id": device_id, "fingerprint": fingerprint, "severity": severity }),
+        )
+        .await;
+        state.emit_event(
+            "device.alert_opened",
+            organization_id,
+            alert_id.to_string(),
+            format!("Alerta {severity}: {summary}"),
+        );
+    }
+    Ok(())
+}
+
+async fn evaluate_metric_alerts(
+    state: &AppState,
+    organization_id: Uuid,
+    device_id: Uuid,
+    actor_id: Option<Uuid>,
+    metrics: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let thresholds = load_rmm_alert_thresholds(state, organization_id).await?;
+    if let Some(cpu) = metrics.get("cpu_load_pct").and_then(|value| value.as_f64()) {
+        sync_metric_alert(
+            state,
+            organization_id,
+            device_id,
+            actor_id,
+            "cpu_high",
+            "Uso de CPU",
+            cpu.clamp(0.0, 100.0),
+            thresholds.cpu_warning_pct,
+            thresholds.cpu_critical_pct,
+            true,
+        )
+        .await?;
+    }
+    if let (Some(used), Some(total)) = (
+        metrics.get("ram_used_mb").and_then(|value| value.as_f64()),
+        metrics.get("ram_total_mb").and_then(|value| value.as_f64()),
+    ) {
+        if total > 0.0 {
+            sync_metric_alert(
+                state,
+                organization_id,
+                device_id,
+                actor_id,
+                "ram_high",
+                "Uso de RAM",
+                (used * 100.0 / total).clamp(0.0, 100.0),
+                thresholds.ram_warning_pct,
+                thresholds.ram_critical_pct,
+                true,
+            )
+            .await?;
+        }
+    }
+    if let Some(free) = metrics
+        .get("c_drive_free_pct")
+        .and_then(|value| value.as_f64())
+    {
+        sync_metric_alert(
+            state,
+            organization_id,
+            device_id,
+            actor_id,
+            "disk_c_low",
+            "Espacio libre en disco C",
+            free.clamp(0.0, 100.0),
+            thresholds.disk_free_warning_pct,
+            thresholds.disk_free_critical_pct,
+            false,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Poll metrics from connected agents on a bounded schedule so trend history and
+/// threshold alerts continue to update without a technician opening each device.
+pub fn spawn_metrics_collector(state: AppState, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        let concurrency = Arc::new(tokio::sync::Semaphore::new(8));
+        loop {
+            ticker.tick().await;
+            let device_ids: Vec<Uuid> = state.active_agents.read().await.keys().copied().collect();
+            if device_ids.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                devices = device_ids.len(),
+                "polling connected agents for RMM metrics"
+            );
+            let mut tasks = tokio::task::JoinSet::new();
+            for device_id in device_ids {
+                let state = state.clone();
+                let concurrency = concurrency.clone();
+                tasks.spawn(async move {
+                    let Ok(_permit) = concurrency.acquire_owned().await else {
+                        return;
+                    };
+                    let organization_id: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT organization_id FROM devices WHERE id = $1 AND status = 'online'",
+                    )
+                    .bind(device_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(organization_id) = organization_id else {
+                        return;
+                    };
+                    let result = dispatch_agent_rpc(
+                        &state,
+                        organization_id,
+                        device_id,
+                        20,
+                        |request_id| ServerToAgentMessage::RunDiagnostic {
+                            request_id,
+                            kind: "metrics".to_string(),
+                        },
+                    )
+                    .await;
+                    let Ok(value) = result else {
+                        tracing::debug!(%device_id, "scheduled metrics collection failed");
+                        return;
+                    };
+                    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                        tracing::debug!(%device_id, "agent rejected scheduled metrics collection");
+                        return;
+                    }
+                    let payload = value.get("data").cloned().unwrap_or_else(|| value.clone());
+                    if let Err(error) = sqlx::query(
+                        "INSERT INTO device_telemetry (organization_id, device_id, kind, payload) VALUES ($1, $2, 'metrics', $3)",
+                    )
+                    .bind(organization_id)
+                    .bind(device_id)
+                    .bind(&payload)
+                    .execute(&state.pool)
+                    .await
+                    {
+                        tracing::warn!(%error, %device_id, "failed to persist scheduled metrics sample");
+                        return;
+                    }
+                    if let Err(error) = evaluate_metric_alerts(
+                        &state,
+                        organization_id,
+                        device_id,
+                        None,
+                        &payload,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error.message, %device_id, "failed to evaluate scheduled metric alerts");
+                    }
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "scheduled metrics worker failed");
+                }
+            }
+        }
+    });
+}
+
 async fn dispatch_agent_rpc(
     state: &AppState,
     org_id: Uuid,
@@ -274,7 +682,9 @@ async fn dispatch_agent_rpc(
         Ok(Ok(val)) => Ok(val),
         _ => {
             state.pending_agent_requests.write().await.remove(&req_id);
-            Err(ApiError::bad_request("timeout esperando respuesta del agente"))
+            Err(ApiError::bad_request(
+                "timeout esperando respuesta del agente",
+            ))
         }
     }
 }
@@ -285,17 +695,30 @@ pub async fn run_device_diagnostic(
     Path(device_id): Path<Uuid>,
     Json(req): Json<RunDiagnosticRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::api::ensure_device_group_access(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        device_id,
+        false,
+    )
+    .await?;
     let kind = req.kind.trim().to_string();
-    let val = dispatch_agent_rpc(&state, auth.user.organization_id, device_id, 20, |request_id| {
-        ServerToAgentMessage::RunDiagnostic {
+    let val = dispatch_agent_rpc(
+        &state,
+        auth.user.organization_id,
+        device_id,
+        20,
+        |request_id| ServerToAgentMessage::RunDiagnostic {
             request_id,
             kind: kind.clone(),
-        }
-    })
+        },
+    )
     .await?;
 
     let payload = val.get("data").cloned().unwrap_or_else(|| val.clone());
-    let _ = sqlx::query(
+    if let Err(error) = sqlx::query(
         "INSERT INTO device_telemetry (organization_id, device_id, kind, payload) VALUES ($1, $2, $3, $4)",
     )
     .bind(auth.user.organization_id)
@@ -303,7 +726,23 @@ pub async fn run_device_diagnostic(
     .bind(&kind)
     .bind(&payload)
     .execute(&state.pool)
-    .await;
+    .await
+    {
+        tracing::warn!(%error, %device_id, "failed to persist device telemetry sample");
+    }
+    if kind.eq_ignore_ascii_case("metrics") {
+        if let Err(error) = evaluate_metric_alerts(
+            &state,
+            auth.user.organization_id,
+            device_id,
+            Some(auth.user.id),
+            &payload,
+        )
+        .await
+        {
+            tracing::warn!(error = %error.message, %device_id, "failed to evaluate device metric alerts");
+        }
+    }
 
     Ok(Json(val))
 }
@@ -313,6 +752,15 @@ pub async fn list_device_telemetry(
     auth: AuthContext,
     Path(device_id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    crate::api::ensure_device_group_access(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        device_id,
+        false,
+    )
+    .await?;
     let rows = sqlx::query(
         "SELECT id, kind, payload, collected_at FROM device_telemetry
          WHERE device_id = $1 AND organization_id = $2
@@ -337,6 +785,122 @@ pub async fn list_device_telemetry(
     ))
 }
 
+pub async fn list_device_alerts(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(device_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    crate::api::ensure_device_group_access(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        device_id,
+        false,
+    )
+    .await?;
+    let rows = sqlx::query(
+        "SELECT a.id, a.fingerprint, a.severity, a.status, a.summary, a.current_value,
+                a.threshold, a.unit, a.occurrence_count, a.first_seen_at, a.last_seen_at,
+                a.acknowledged_at, a.resolved_at, u.display_name AS acknowledged_by
+         FROM device_alerts a
+         LEFT JOIN users u ON u.id = a.acknowledged_by
+         WHERE a.organization_id = $1 AND a.device_id = $2
+         ORDER BY CASE a.status WHEN 'open' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END,
+                  a.last_seen_at DESC
+         LIMIT 50",
+    )
+    .bind(auth.user.organization_id)
+    .bind(device_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "fingerprint": row.get::<String, _>("fingerprint"),
+                    "severity": row.get::<String, _>("severity"),
+                    "status": row.get::<String, _>("status"),
+                    "summary": row.get::<String, _>("summary"),
+                    "current_value": row.get::<f64, _>("current_value"),
+                    "threshold": row.get::<f64, _>("threshold"),
+                    "unit": row.get::<String, _>("unit"),
+                    "occurrence_count": row.get::<i32, _>("occurrence_count"),
+                    "first_seen_at": row.get::<DateTime<Utc>, _>("first_seen_at"),
+                    "last_seen_at": row.get::<DateTime<Utc>, _>("last_seen_at"),
+                    "acknowledged_at": row.get::<Option<DateTime<Utc>>, _>("acknowledged_at"),
+                    "resolved_at": row.get::<Option<DateTime<Utc>>, _>("resolved_at"),
+                    "acknowledged_by": row.get::<Option<String>, _>("acknowledged_by"),
+                })
+            })
+            .collect(),
+    ))
+}
+
+pub async fn acknowledge_device_alert(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(alert_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if matches!(auth.user.role.as_str(), "client" | "auditor") {
+        return Err(ApiError::forbidden("role cannot acknowledge device alerts"));
+    }
+    let device_id: Uuid = sqlx::query_scalar(
+        "SELECT device_id FROM device_alerts WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(alert_id)
+    .bind(auth.user.organization_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("device alert not found"))?;
+    crate::api::ensure_device_group_access(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        device_id,
+        true,
+    )
+    .await?;
+
+    let updated = sqlx::query(
+        "UPDATE device_alerts SET status = 'acknowledged', acknowledged_by = $3,
+             acknowledged_at = now(), updated_at = now()
+         WHERE id = $1 AND organization_id = $2 AND status = 'open'
+         RETURNING id",
+    )
+    .bind(alert_id)
+    .bind(auth.user.organization_id)
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if updated.is_none() {
+        return Err(ApiError::conflict("device alert is no longer open"));
+    }
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "rmm.alert_acknowledged",
+        "device_alert",
+        &alert_id.to_string(),
+        "success",
+        json!({ "device_id": device_id }),
+    )
+    .await;
+    state.emit_event(
+        "device.alert_acknowledged",
+        auth.user.organization_id,
+        alert_id.to_string(),
+        format!("Alerta reconocida por {}", auth.user.display_name),
+    );
+    Ok(Json(json!({ "ok": true, "id": alert_id })))
+}
+
 pub async fn run_device_command(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -346,6 +910,15 @@ pub async fn run_device_command(
     if matches!(auth.user.role.as_str(), "auditor" | "client") {
         return Err(ApiError::forbidden("role cannot execute remote commands"));
     }
+    crate::api::ensure_device_group_access(
+        &state.pool,
+        auth.user.organization_id,
+        auth.user.id,
+        &auth.user.role,
+        device_id,
+        true,
+    )
+    .await?;
     let shell = if req.shell.eq_ignore_ascii_case("cmd") {
         "cmd".to_string()
     } else {
@@ -502,7 +1075,7 @@ fn autonomy_str(a: AiAutonomyLevel) -> &'static str {
 
 async fn load_org_ai_config(pool: &sqlx::PgPool, org_id: Uuid) -> Result<AiConfig, ApiError> {
     let row = sqlx::query(
-        "SELECT provider, model, base_url, api_key, oauth_client_id, oauth_auth_url, oauth_token_url, oauth_access_token, oauth_refresh_token, autonomy_level, redact_pii
+        "SELECT provider, model, base_url, api_key, oauth_client_id, oauth_auth_url, oauth_token_url, oauth_access_token, oauth_refresh_token, autonomy_level, redact_pii, reasoning_effort
          FROM ai_settings WHERE organization_id = $1",
     )
     .bind(org_id)
@@ -510,28 +1083,198 @@ async fn load_org_ai_config(pool: &sqlx::PgPool, org_id: Uuid) -> Result<AiConfi
     .await?;
 
     Ok(match row {
-        Some(r) => AiConfig {
-            provider: parse_provider(r.get::<String, _>("provider").as_str()),
-            model: r.get("model"),
-            base_url: r.get("base_url"),
-            api_key: r.get("api_key"),
-            oauth_client_id: r.get("oauth_client_id"),
-            oauth_auth_url: r.get("oauth_auth_url"),
-            oauth_token_url: r.get("oauth_token_url"),
-            oauth_access_token: r.get("oauth_access_token"),
-            oauth_refresh_token: r.get("oauth_refresh_token"),
-            autonomy_level: parse_autonomy(r.get::<String, _>("autonomy_level").as_str()),
-            redact_pii: r.get("redact_pii"),
-        },
+        Some(r) => {
+            let mut cfg = AiConfig {
+                provider: parse_provider(r.get::<String, _>("provider").as_str()),
+                model: r.get("model"),
+                base_url: r.get("base_url"),
+                api_key: r.get("api_key"),
+                oauth_client_id: r.get("oauth_client_id"),
+                oauth_auth_url: r.get("oauth_auth_url"),
+                oauth_token_url: r.get("oauth_token_url"),
+                oauth_access_token: r.get("oauth_access_token"),
+                oauth_refresh_token: r.get("oauth_refresh_token"),
+                autonomy_level: parse_autonomy(r.get::<String, _>("autonomy_level").as_str()),
+                redact_pii: r.get("redact_pii"),
+                reasoning_effort: normalize_reasoning_effort(
+                    r.get::<String, _>("reasoning_effort").as_str(),
+                ),
+            };
+            if matches!(
+                cfg.oauth_client_id.trim(),
+                "" | "agentdesk-desktop-client" | "dynamic_agent_client"
+            ) {
+                cfg.oauth_client_id = OPENCODE_OAUTH_CLIENT_ID.into();
+            }
+            if cfg.oauth_auth_url.trim().is_empty()
+                || cfg.oauth_auth_url == "https://auth.openai.com/api/accounts/authorize"
+            {
+                cfg.oauth_auth_url = OPENCODE_OAUTH_AUTH_URL.into();
+            }
+            if cfg.oauth_token_url.trim().is_empty()
+                || cfg.oauth_token_url == "https://auth.openai.com/api/accounts/oauth/token"
+            {
+                cfg.oauth_token_url = OPENCODE_OAUTH_TOKEN_URL.into();
+            }
+            if cfg.provider == AiProviderKind::ChatGptOAuth && is_legacy_or_internal_model(&cfg.model) {
+                cfg.model = "gpt-6-luna".into();
+            }
+            cfg
+        }
         None => AiConfig::default(),
     })
+}
+
+async fn save_oauth_tokens(
+    pool: &sqlx::PgPool,
+    org_id: Uuid,
+    client_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ai_settings (organization_id, provider, oauth_client_id, oauth_access_token, oauth_refresh_token, updated_at)
+         VALUES ($1, 'chat_gpt_o_auth', $2, $3, $4, now())
+         ON CONFLICT (organization_id) DO UPDATE SET
+           provider = 'chat_gpt_o_auth',
+           oauth_client_id = EXCLUDED.oauth_client_id,
+           oauth_access_token = EXCLUDED.oauth_access_token,
+           oauth_refresh_token = EXCLUDED.oauth_refresh_token,
+           updated_at = now()",
+    )
+    .bind(org_id)
+    .bind(client_id)
+    .bind(access_token)
+    .bind(refresh_token)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+static OAUTH_REFRESH_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn ensure_fresh_oauth_token(
+    state: &AppState,
+    org_id: Uuid,
+    cfg: &mut AiConfig,
+    http: &reqwest::Client,
+    force: bool,
+) -> bool {
+    if cfg.provider != AiProviderKind::ChatGptOAuth || cfg.oauth_refresh_token.trim().is_empty() {
+        return false;
+    }
+    if !force
+        && !cfg.oauth_access_token.trim().is_empty()
+        && !jwt_is_expired_or_soon(&cfg.oauth_access_token)
+    {
+        return false;
+    }
+
+    let _guard = OAUTH_REFRESH_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    if let Ok(latest) = load_org_ai_config(&state.pool, org_id).await {
+        cfg.oauth_access_token = latest.oauth_access_token;
+        cfg.oauth_refresh_token = latest.oauth_refresh_token;
+        cfg.oauth_client_id = latest.oauth_client_id;
+        cfg.oauth_token_url = latest.oauth_token_url;
+        if !force
+            && !cfg.oauth_access_token.trim().is_empty()
+            && !jwt_is_expired_or_soon(&cfg.oauth_access_token)
+        {
+            return true;
+        }
+    }
+
+    if cfg.oauth_refresh_token.trim().is_empty() {
+        return false;
+    }
+
+    match refresh_oauth_token(http, cfg).await {
+        Ok(tok) => {
+            cfg.oauth_access_token = tok.access_token;
+            if let Some(rt) = tok.refresh_token.filter(|s| !s.trim().is_empty()) {
+                cfg.oauth_refresh_token = rt;
+            }
+            let _ = save_oauth_tokens(
+                &state.pool,
+                org_id,
+                &cfg.oauth_client_id,
+                &cfg.oauth_access_token,
+                &cfg.oauth_refresh_token,
+            )
+            .await;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%org_id, error = %e, "ChatGPT OAuth token refresh failed");
+            false
+        }
+    }
+}
+
+async fn complete_oauth_exchange(
+    state: &AppState,
+    code: &str,
+    st: &str,
+    callback_client_id: Option<&str>,
+) -> Result<(Uuid, AiConfig), String> {
+    let pending = state.pending_oauth_states.write().await.remove(st);
+    let Some((org_id, verifier, redirect_uri)) = pending else {
+        return Err("Estado OAuth expirado. Iniciá la vinculación nuevamente desde AgentDesk.".into());
+    };
+    let mut cfg = load_org_ai_config(&state.pool, org_id)
+        .await
+        .map_err(|e| format!("DB error: {e:?}"))?;
+    let http = reqwest::Client::new();
+    let tok = exchange_oauth_code(
+        &http,
+        &cfg,
+        code,
+        &verifier,
+        &redirect_uri,
+        callback_client_id,
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+    cfg.provider = AiProviderKind::ChatGptOAuth;
+    cfg.oauth_access_token = tok.access_token;
+    if let Some(cid) = callback_client_id.filter(|v| v.starts_with("oaiapp_") || v.starts_with("app_")) {
+        cfg.oauth_client_id = cid.to_string();
+    }
+    if let Some(rt) = tok.refresh_token {
+        cfg.oauth_refresh_token = rt;
+    }
+    save_oauth_tokens(
+        &state.pool,
+        org_id,
+        &cfg.oauth_client_id,
+        &cfg.oauth_access_token,
+        &cfg.oauth_refresh_token,
+    )
+    .await
+    .map_err(|e| format!("DB save error: {e}"))?;
+    Ok((org_id, cfg))
 }
 
 pub async fn get_ai_settings(
     State(state): State<AppState>,
     auth: AuthContext,
 ) -> Result<Json<AiSettingsDto>, ApiError> {
-    let cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
+    let mut cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
+    if cfg.provider == AiProviderKind::ChatGptOAuth
+        && !cfg.oauth_refresh_token.trim().is_empty()
+        && (cfg.oauth_access_token.trim().is_empty()
+            || jwt_is_expired_or_soon(&cfg.oauth_access_token))
+    {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        ensure_fresh_oauth_token(&state, auth.user.organization_id, &mut cfg, &http, false).await;
+    }
     Ok(Json(AiSettingsDto {
         provider: provider_str(cfg.provider).into(),
         model: cfg.model,
@@ -540,9 +1283,11 @@ pub async fn get_ai_settings(
         oauth_client_id: cfg.oauth_client_id,
         oauth_auth_url: cfg.oauth_auth_url,
         oauth_token_url: cfg.oauth_token_url,
-        oauth_connected: !cfg.oauth_access_token.trim().is_empty(),
+        oauth_connected: !cfg.oauth_access_token.trim().is_empty()
+            || !cfg.oauth_refresh_token.trim().is_empty(),
         autonomy_level: autonomy_str(cfg.autonomy_level).into(),
         redact_pii: cfg.redact_pii,
+        reasoning_effort: cfg.reasoning_effort,
     }))
 }
 
@@ -586,10 +1331,11 @@ pub async fn update_ai_settings(
     }
     cfg.autonomy_level = parse_autonomy(&req.autonomy_level);
     cfg.redact_pii = req.redact_pii;
+    cfg.reasoning_effort = normalize_reasoning_effort(&req.reasoning_effort);
 
     sqlx::query(
-        "INSERT INTO ai_settings (organization_id, provider, model, base_url, api_key, oauth_client_id, oauth_auth_url, oauth_token_url, oauth_access_token, oauth_refresh_token, autonomy_level, redact_pii, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+        "INSERT INTO ai_settings (organization_id, provider, model, base_url, api_key, oauth_client_id, oauth_auth_url, oauth_token_url, oauth_access_token, oauth_refresh_token, autonomy_level, redact_pii, reasoning_effort, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
          ON CONFLICT (organization_id) DO UPDATE SET
            provider = EXCLUDED.provider,
            model = EXCLUDED.model,
@@ -602,6 +1348,7 @@ pub async fn update_ai_settings(
            oauth_refresh_token = EXCLUDED.oauth_refresh_token,
            autonomy_level = EXCLUDED.autonomy_level,
            redact_pii = EXCLUDED.redact_pii,
+           reasoning_effort = EXCLUDED.reasoning_effort,
            updated_at = now()",
     )
     .bind(auth.user.organization_id)
@@ -616,6 +1363,7 @@ pub async fn update_ai_settings(
     .bind(&cfg.oauth_refresh_token)
     .bind(autonomy_str(cfg.autonomy_level))
     .bind(cfg.redact_pii)
+    .bind(&cfg.reasoning_effort)
     .execute(&state.pool)
     .await?;
 
@@ -630,6 +1378,7 @@ pub async fn update_ai_settings(
         oauth_connected: !cfg.oauth_access_token.trim().is_empty(),
         autonomy_level: autonomy_str(cfg.autonomy_level).into(),
         redact_pii: cfg.redact_pii,
+        reasoning_effort: cfg.reasoning_effort,
     }))
 }
 
@@ -639,15 +1388,69 @@ pub async fn ai_oauth_start(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
     let pkce = generate_pkce();
-    let redirect_uri = format!(
-        "{}/api/v1/ai/oauth/callback",
-        state.public_url.trim_end_matches('/')
-    );
+    let redirect_uri = if cfg.oauth_client_id == OPENCODE_OAUTH_CLIENT_ID {
+        OPENCODE_OAUTH_REDIRECT_URI.to_string()
+    } else {
+        format!(
+            "{}/api/v1/ai/oauth/callback",
+            state.public_url.trim_end_matches('/')
+        )
+    };
     let authorize_url = build_oauth_authorize_url(&cfg, &redirect_uri, &pkce);
     state.pending_oauth_states.write().await.insert(
         pkce.state.clone(),
-        (auth.user.organization_id, pkce.verifier, redirect_uri.clone()),
+        (
+            auth.user.organization_id,
+            pkce.verifier,
+            redirect_uri.clone(),
+        ),
     );
+
+    if redirect_uri == OPENCODE_OAUTH_REDIRECT_URI {
+        let st_clone = state.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:1455").await else {
+                return;
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            loop {
+                let accept_res = tokio::time::timeout_at(deadline, listener.accept()).await;
+                let Ok(Ok((mut sock, _))) = accept_res else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let path_q = first_line.split_whitespace().nth(1).unwrap_or("");
+                if !path_q.starts_with("/auth/callback") {
+                    let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found").await;
+                    continue;
+                }
+                let query = path_q.split_once('?').map(|x| x.1).unwrap_or("");
+                let (code, st_val, err_msg) = parse_oauth_query_params(query);
+                let html = if let Some(err) = err_msg {
+                    format!("<h2>Error OAuth ChatGPT</h2><p>{err}</p>")
+                } else if let (Some(c), Some(s)) = (code, st_val) {
+                    match complete_oauth_exchange(&st_clone, &c, &s, None).await {
+                        Ok(_) => "<h2>ChatGPT OAuth conectado</h2><p>Podés cerrar esta pestaña y volver a AgentDesk.</p>".to_string(),
+                        Err(e) => format!("<h2>Error intercambiando token OAuth</h2><p>{e}</p>"),
+                    }
+                } else {
+                    "<h2>Callback inválido</h2><p>Faltan parámetros code/state.</p>".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                break;
+            }
+        });
+    }
+
     Ok(Json(json!({
         "authorize_url": authorize_url,
         "redirect_uri": redirect_uri,
@@ -655,11 +1458,212 @@ pub async fn ai_oauth_start(
     })))
 }
 
+pub async fn ai_oauth_device_start(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let org_id = auth.user.organization_id;
+    let cfg = load_org_ai_config(&state.pool, org_id).await?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    let started = start_device_auth(&http, &cfg)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e}")))?;
+
+    let state_bg = state.clone();
+    let cfg_bg = cfg.clone();
+    let device_auth_id = started.device_auth_id.clone();
+    let user_code = started.user_code.clone();
+    let poll_secs = started.interval_secs.max(5);
+    tokio::spawn(async move {
+        let http_bg = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(poll_secs)).await;
+            match poll_device_auth(&http_bg, &device_auth_id, &user_code).await {
+                Ok(DeviceAuthPoll::Pending) => continue,
+                Ok(DeviceAuthPoll::Authorized {
+                    authorization_code,
+                    code_verifier,
+                }) => {
+                    if let Ok(tok) = exchange_device_auth_code(
+                        &http_bg,
+                        &cfg_bg,
+                        &authorization_code,
+                        &code_verifier,
+                    )
+                    .await
+                    {
+                        let rt = tok
+                            .refresh_token
+                            .unwrap_or_else(|| cfg_bg.oauth_refresh_token.clone());
+                        let cid = if cfg_bg.oauth_client_id.trim().is_empty()
+                            || cfg_bg.oauth_client_id == "dynamic_agent_client"
+                        {
+                            OPENCODE_OAUTH_CLIENT_ID
+                        } else {
+                            cfg_bg.oauth_client_id.trim()
+                        };
+                        let _ = save_oauth_tokens(
+                            &state_bg.pool,
+                            org_id,
+                            cid,
+                            &tok.access_token,
+                            &rt,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                Ok(DeviceAuthPoll::Failed(_)) | Err(_) => break,
+            }
+        }
+    });
+
+    Ok(Json(json!({
+        "device_auth_id": started.device_auth_id,
+        "user_code": started.user_code,
+        "verify_url": started.verify_url,
+        "interval_secs": started.interval_secs,
+    })))
+}
+
+fn parse_oauth_query_params(query: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let dec = urlencoding::decode(v)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| v.to_string());
+            match k {
+                "code" => code = Some(dec),
+                "state" => state = Some(dec),
+                "error_description" | "error" => error = Some(dec),
+                _ => {}
+            }
+        }
+    }
+    (code, state, error)
+}
+
+#[derive(Deserialize)]
+pub struct OAuthCompleteRequest {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub callback_url: Option<String>,
+}
+
+pub async fn ai_oauth_complete(
+    State(state): State<AppState>,
+    _auth: AuthContext,
+    Json(req): Json<OAuthCompleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (mut code, mut st) = (req.code, req.state);
+    if let Some(cb) = req.callback_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let query = cb.split_once('?').map(|x| x.1).unwrap_or(cb);
+        let (qc, qs, err) = parse_oauth_query_params(query);
+        if let Some(e) = err {
+            return Err(ApiError::bad_request(e));
+        }
+        if code.is_none() {
+            code = qc;
+        }
+        if st.is_none() {
+            st = qs;
+        }
+    }
+    let (Some(code), Some(st)) = (code.filter(|s| !s.is_empty()), st.filter(|s| !s.is_empty())) else {
+        return Err(ApiError::bad_request("Faltan code/state o callback_url válido"));
+    };
+    let (_org_id, cfg) = complete_oauth_exchange(&state, &code, &st, None)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .unwrap_or_default();
+    let models = list_available_models(&http, &cfg).await;
+    Ok(Json(json!({
+        "connected": true,
+        "selected_model": cfg.model,
+        "models": models,
+    })))
+}
+
+pub async fn ai_oauth_disconnect(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    sqlx::query(
+        "UPDATE ai_settings SET oauth_access_token = '', oauth_refresh_token = '', updated_at = now() WHERE organization_id = $1",
+    )
+    .bind(auth.user.organization_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(json!({ "connected": false })))
+}
+
+pub async fn list_ai_models(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .unwrap_or_default();
+    ensure_fresh_oauth_token(&state, auth.user.organization_id, &mut cfg, &http, false).await;
+    let connected = match cfg.provider {
+        AiProviderKind::ChatGptOAuth => !cfg.oauth_access_token.trim().is_empty(),
+        AiProviderKind::OpenAiApi => !cfg.api_key.trim().is_empty(),
+        AiProviderKind::OllamaLocal => true,
+        AiProviderKind::Disabled => false,
+    };
+    let models = if connected {
+        list_available_models(&http, &cfg).await
+    } else {
+        Vec::new()
+    };
+    if connected && cfg.provider == AiProviderKind::ChatGptOAuth {
+        let missing_or_legacy = is_legacy_or_internal_model(&cfg.model)
+            || (!models.is_empty() && !models.iter().any(|m| m.id == cfg.model));
+        if missing_or_legacy {
+            if let Some(best_luna) = pick_default_luna_model(&models) {
+                cfg.model = best_luna;
+                let _ = sqlx::query(
+                    "UPDATE ai_settings SET model = $2, reasoning_effort = $3, updated_at = now() WHERE organization_id = $1",
+                )
+                .bind(auth.user.organization_id)
+                .bind(&cfg.model)
+                .bind(&cfg.reasoning_effort)
+                .execute(&state.pool)
+                .await;
+            }
+        }
+    }
+    Ok(Json(json!({
+        "connected": connected,
+        "provider": provider_str(cfg.provider),
+        "selected_model": cfg.model,
+        "reasoning_effort": cfg.reasoning_effort,
+        "models": models,
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct OAuthCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
+    pub client_id: Option<String>,
     pub error: Option<String>,
+    pub error_description: Option<String>,
 }
 
 pub async fn ai_oauth_callback(
@@ -667,45 +1671,20 @@ pub async fn ai_oauth_callback(
     Query(q): Query<OAuthCallbackQuery>,
 ) -> Html<String> {
     if let Some(err) = q.error {
-        return Html(format!(
-            "<h2>Error OAuth ChatGPT</h2><p>{err}</p>"
-        ));
+        let detail = q.error_description.unwrap_or(err);
+        let safe_detail = detail
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        return Html(format!("<h2>Error OAuth ChatGPT</h2><p>{safe_detail}</p>"));
     }
     let (Some(code), Some(st)) = (q.code, q.state) else {
         return Html("<h2>Callback inválido</h2><p>Faltan parámetros code/state.</p>".into());
     };
-    let pending = state.pending_oauth_states.write().await.remove(&st);
-    let Some((org_id, verifier, redirect_uri)) = pending else {
-        return Html("<h2>Estado OAuth expirado</h2><p>Vuelve a iniciar el flujo desde AgentDesk.</p>".into());
-    };
-
-    let Ok(mut cfg) = load_org_ai_config(&state.pool, org_id).await else {
-        return Html("<h2>Error interno</h2>".into());
-    };
-    let http = reqwest::Client::new();
-    match exchange_oauth_code(&http, &cfg, &code, &verifier, &redirect_uri).await {
-        Ok(tok) => {
-            cfg.provider = AiProviderKind::ChatGptOAuth;
-            cfg.oauth_access_token = tok.access_token;
-            if let Some(rt) = tok.refresh_token {
-                cfg.oauth_refresh_token = rt;
-            }
-            let _ = sqlx::query(
-                "INSERT INTO ai_settings (organization_id, provider, oauth_access_token, oauth_refresh_token, updated_at)
-                 VALUES ($1, 'chat_gpt_o_auth', $2, $3, now())
-                 ON CONFLICT (organization_id) DO UPDATE SET
-                   provider = 'chat_gpt_o_auth',
-                   oauth_access_token = EXCLUDED.oauth_access_token,
-                   oauth_refresh_token = EXCLUDED.oauth_refresh_token,
-                   updated_at = now()",
-            )
-            .bind(org_id)
-            .bind(&cfg.oauth_access_token)
-            .bind(&cfg.oauth_refresh_token)
-            .execute(&state.pool)
-            .await;
-            Html("<h2>ChatGPT OAuth conectado</h2><p>Puedes cerrar esta pestaña y volver a AgentDesk.</p>".into())
-        }
+    match complete_oauth_exchange(&state, &code, &st, q.client_id.as_deref()).await {
+        Ok(_) => Html(
+            "<h2>ChatGPT OAuth conectado</h2><p>Puedes cerrar esta pestaña y volver a AgentDesk.</p>".into(),
+        ),
         Err(e) => Html(format!(
             "<h2>Error intercambiando token OAuth</h2><p>{e}</p>"
         )),
@@ -717,11 +1696,106 @@ pub async fn ai_chat(
     auth: AuthContext,
     Json(req): Json<AiChatRequest>,
 ) -> Result<Json<AiChatResponse>, ApiError> {
-    let cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
+    let mut cfg = load_org_ai_config(&state.pool, auth.user.organization_id).await?;
     let mut diag_snapshot = None;
     let mut screenshot_b64 = None;
+    let mut ticket_context = None;
+
+    if let Some(ticket_id) = req.ticket_id {
+        let ticket = sqlx::query(
+            "SELECT public_code, company_name, category, description, device_id
+             FROM support_requests WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(ticket_id)
+        .bind(auth.user.organization_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("ticket context lookup: {e}")))?
+        .ok_or_else(|| {
+            ApiError::not_found("El ticket no existe o no pertenece a esta organización")
+        })?;
+        let ticket_device_id: Option<Uuid> = ticket.get("device_id");
+        if let Some(ticket_device_id) = ticket_device_id {
+            crate::api::ensure_device_group_access(
+                &state.pool,
+                auth.user.organization_id,
+                auth.user.id,
+                &auth.user.role,
+                ticket_device_id,
+                false,
+            )
+            .await?;
+        }
+        if let (Some(ticket_device_id), Some(request_device_id)) = (ticket_device_id, req.device_id)
+        {
+            if ticket_device_id != request_device_id {
+                return Err(ApiError::bad_request(
+                    "El equipo seleccionado no coincide con el equipo asociado al ticket",
+                ));
+            }
+        }
+        let sessions = sqlx::query(
+            "SELECT d.hostname, s.status, s.allow_control, s.started_at, s.ended_at
+             FROM remote_sessions s
+             JOIN devices d ON d.id = s.device_id AND d.organization_id = s.organization_id
+             WHERE s.ticket_id = $1 AND s.organization_id = $2
+             ORDER BY s.created_at ASC LIMIT 25",
+        )
+        .bind(ticket_id)
+        .bind(auth.user.organization_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("ticket session context lookup: {e}")))?;
+        let session_context = sessions
+            .iter()
+            .map(|session| {
+                let hostname: String = session.get("hostname");
+                let status: String = session.get("status");
+                let allow_control: bool = session.get("allow_control");
+                let started_at: Option<DateTime<Utc>> = session.get("started_at");
+                let ended_at: Option<DateTime<Utc>> = session.get("ended_at");
+                let duration = started_at
+                    .zip(ended_at)
+                    .map(|(start, end)| format!("{} segundos", (end - start).num_seconds().max(0)))
+                    .unwrap_or_else(|| "duración no disponible".into());
+                format!(
+                    "{hostname} · {} · {status} · {duration}",
+                    if allow_control {
+                        "control"
+                    } else {
+                        "solo vista"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session_context = if session_context.is_empty() {
+            "Sin sesiones asociadas".into()
+        } else {
+            session_context
+        };
+        ticket_context = Some(format!(
+            "Código: {}\nEmpresa: {}\nCategoría: {}\nDescripción: {}\nSesiones asociadas:\n{}",
+            ticket.get::<String, _>("public_code"),
+            ticket.get::<String, _>("company_name"),
+            ticket.get::<String, _>("category"),
+            ticket.get::<String, _>("description"),
+            session_context,
+        ));
+    }
 
     if let Some(did) = req.device_id {
+        if req.include_diagnostics || req.include_screenshot {
+            crate::api::ensure_device_group_access(
+                &state.pool,
+                auth.user.organization_id,
+                auth.user.id,
+                &auth.user.role,
+                did,
+                false,
+            )
+            .await?;
+        }
         if req.include_diagnostics {
             if let Ok(val) = dispatch_agent_rpc(&state, auth.user.organization_id, did, 18, |rid| {
                 ServerToAgentMessage::RunDiagnostic {
@@ -751,26 +1825,79 @@ pub async fn ai_chat(
         }
     }
 
-    let machine_context = diag_snapshot
+    let mut context_sections = Vec::new();
+    if let Some(ticket) = ticket_context {
+        context_sections.push(format!("=== CONTEXTO DEL TICKET ===\n{ticket}"));
+    }
+    if let Some(diagnostics) = diag_snapshot
         .as_ref()
-        .map(|d| serde_json::to_string_pretty(d).unwrap_or_default());
+        .map(|d| serde_json::to_string_pretty(d).unwrap_or_default())
+    {
+        context_sections.push(format!("=== DIAGNÓSTICO DEL EQUIPO ===\n{diagnostics}"));
+    }
+    let machine_context = (!context_sections.is_empty()).then(|| context_sections.join("\n\n"));
+
+    let chat_session_id = req.chat_session_id.unwrap_or_else(Uuid::new_v4);
+    let effort = normalize_reasoning_effort(
+        req.reasoning_effort
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&cfg.reasoning_effort),
+    );
+    let history_rows = sqlx::query(
+        "SELECT prompt, reply FROM (
+             SELECT prompt, reply, created_at
+             FROM ai_conversations
+             WHERE organization_id = $1 AND chat_session_id = $2
+             ORDER BY created_at DESC
+             LIMIT 16
+         ) sub ORDER BY created_at ASC",
+    )
+    .bind(auth.user.organization_id)
+    .bind(chat_session_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let history: Vec<ChatHistoryTurn> = history_rows
+        .iter()
+        .map(|r| ChatHistoryTurn {
+            prompt: r.get("prompt"),
+            reply: r.get("reply"),
+        })
+        .collect();
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .build()
         .unwrap_or_default();
+    ensure_fresh_oauth_token(&state, auth.user.organization_id, &mut cfg, &http, false).await;
 
-    let resp = ask_copilot(
-        &http,
-        &cfg,
-        CopilotRequest {
-            prompt: req.prompt.clone(),
-            machine_context,
-            screenshot_jpeg_b64: screenshot_b64,
-        },
-    )
-    .await
-    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let copilot_req = CopilotRequest {
+        prompt: req.prompt.clone(),
+        machine_context,
+        screenshot_jpeg_b64: screenshot_b64,
+        model_override: req.model.clone(),
+        reasoning_effort_override: Some(effort.clone()),
+        history,
+    };
+    let resp = match ask_copilot(&http, &cfg, copilot_req.clone()).await {
+        Ok(r) => r,
+        Err(e)
+            if cfg.provider == AiProviderKind::ChatGptOAuth
+                && !cfg.oauth_refresh_token.trim().is_empty()
+                && (e.to_string().contains("401") || e.to_string().contains("Unauthorized")) =>
+        {
+            if ensure_fresh_oauth_token(&state, auth.user.organization_id, &mut cfg, &http, true).await
+            {
+                ask_copilot(&http, &cfg, copilot_req)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))?
+            } else {
+                return Err(ApiError::bad_request(e.to_string()));
+            }
+        }
+        Err(e) => return Err(ApiError::bad_request(e.to_string())),
+    };
 
     let actions_dto: Vec<AiProposedActionDto> = resp
         .proposed_actions
@@ -786,17 +1913,20 @@ pub async fn ai_chat(
         .collect();
 
     let _ = sqlx::query(
-        "INSERT INTO ai_conversations (id, organization_id, user_id, device_id, ticket_id, prompt, reply, provider_used, proposed_actions)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "INSERT INTO ai_conversations (id, organization_id, user_id, device_id, ticket_id, chat_session_id, prompt, reply, provider_used, model_used, reasoning_effort, proposed_actions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(Uuid::new_v4())
     .bind(auth.user.organization_id)
     .bind(auth.user.id)
     .bind(req.device_id)
     .bind(req.ticket_id)
+    .bind(chat_session_id)
     .bind(&req.prompt)
     .bind(&resp.reply)
     .bind(&resp.provider_used)
+    .bind(&resp.model_used)
+    .bind(&effort)
     .bind(serde_json::to_value(&actions_dto).unwrap_or_default())
     .execute(&state.pool)
     .await;
@@ -808,9 +1938,11 @@ pub async fn ai_chat(
         "user",
         "ai.chat",
         "ai_copilot",
-        &req.device_id.map(|d| d.to_string()).unwrap_or_else(|| "global".into()),
+        &req.device_id
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "global".into()),
         "success",
-        json!({ "provider": resp.provider_used, "actions_count": actions_dto.len() }),
+        json!({ "provider": resp.provider_used, "model": resp.model_used, "effort": effort, "actions_count": actions_dto.len() }),
     )
     .await;
 
@@ -821,7 +1953,109 @@ pub async fn ai_chat(
         model_used: resp.model_used,
         redacted_context_applied: resp.redacted_context_applied,
         diagnostics_snapshot: diag_snapshot,
+        chat_session_id: Some(chat_session_id),
+        reasoning_effort: effort,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct AiSessionListQuery {
+    pub device_id: Option<Uuid>,
+}
+
+pub async fn list_ai_chat_sessions(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(q): Query<AiSessionListQuery>,
+) -> Result<Json<Vec<AiChatSessionSummaryDto>>, ApiError> {
+    if let Some(did) = q.device_id {
+        crate::api::ensure_device_group_access(
+            &state.pool,
+            auth.user.organization_id,
+            auth.user.id,
+            &auth.user.role,
+            did,
+            false,
+        )
+        .await?;
+    }
+    let rows = sqlx::query(
+        "SELECT
+            COALESCE(chat_session_id, id) AS sid,
+            device_id,
+            (ARRAY_AGG(prompt ORDER BY created_at ASC))[1] AS first_prompt,
+            COUNT(*) AS msg_count,
+            COALESCE((ARRAY_AGG(model_used ORDER BY created_at DESC))[1], '') AS last_model,
+            COALESCE((ARRAY_AGG(reasoning_effort ORDER BY created_at DESC))[1], 'high') AS last_effort,
+            MAX(created_at) AS last_at
+         FROM ai_conversations
+         WHERE organization_id = $1
+           AND ($2::uuid IS NULL AND device_id IS NULL OR device_id = $2)
+         GROUP BY COALESCE(chat_session_id, id), device_id
+         ORDER BY MAX(created_at) DESC
+         LIMIT 25",
+    )
+    .bind(auth.user.organization_id)
+    .bind(q.device_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let out = rows
+        .into_iter()
+        .map(|r| {
+            let first: String = r.get("first_prompt");
+            let title = first.chars().take(48).collect::<String>();
+            AiChatSessionSummaryDto {
+                chat_session_id: r.get("sid"),
+                device_id: r.get("device_id"),
+                title,
+                message_count: r.get("msg_count"),
+                last_model: r.get("last_model"),
+                last_reasoning_effort: r.get("last_effort"),
+                last_at: r.get("last_at"),
+            }
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+pub async fn list_ai_chat_messages(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Vec<AiChatMessageDto>>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, COALESCE(chat_session_id, id) AS sid, device_id, prompt, reply, model_used, reasoning_effort, proposed_actions, created_at
+         FROM ai_conversations
+         WHERE organization_id = $1 AND (chat_session_id = $2 OR id = $2)
+         ORDER BY created_at ASC
+         LIMIT 100",
+    )
+    .bind(auth.user.organization_id)
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let out = rows
+        .into_iter()
+        .map(|r| {
+            let actions_val: serde_json::Value = r.get("proposed_actions");
+            let proposed_actions = serde_json::from_value::<Vec<AiProposedActionDto>>(actions_val)
+                .unwrap_or_default();
+            AiChatMessageDto {
+                id: r.get("id"),
+                chat_session_id: r.get("sid"),
+                device_id: r.get("device_id"),
+                prompt: r.get("prompt"),
+                reply: r.get("reply"),
+                model_used: r.get("model_used"),
+                reasoning_effort: r.get("reasoning_effort"),
+                proposed_actions,
+                created_at: r.get("created_at"),
+            }
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 pub async fn ai_execute_approved_action(
@@ -909,9 +2143,17 @@ pub async fn mcp_rpc_handler(
             match name {
                 "list_devices" => {
                     let rows = sqlx::query(
-                        "SELECT id, public_code, hostname, status, os_name, private_mem_mb FROM devices WHERE organization_id = $1 ORDER BY last_heartbeat_at DESC",
+                        "SELECT d.id, d.public_code, d.hostname, d.status, d.os_name, d.private_mem_mb
+                         FROM devices d
+                         LEFT JOIN device_groups g ON g.id = d.group_id AND g.organization_id = d.organization_id
+                         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+                         WHERE d.organization_id = $1
+                           AND (d.group_id IS NULL OR g.owner_user_id = $2 OR s.user_id IS NOT NULL OR $3 IN ('instance_admin', 'admin', 'org_admin'))
+                         ORDER BY d.last_heartbeat_at DESC",
                     )
                     .bind(auth.user.organization_id)
+                    .bind(auth.user.id)
+                    .bind(&auth.user.role)
                     .fetch_all(&state.pool)
                     .await?;
                     let items: Vec<_> = rows
@@ -954,14 +2196,27 @@ pub async fn mcp_rpc_handler(
                     let did_str = args.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
                     let did = Uuid::parse_str(did_str)
                         .map_err(|_| ApiError::bad_request("invalid device_id"))?;
-                    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("metrics");
-                    let val = dispatch_agent_rpc(&state, auth.user.organization_id, did, 18, |rid| {
-                        ServerToAgentMessage::RunDiagnostic {
-                            request_id: rid,
-                            kind: kind.into(),
-                        }
-                    })
+                    crate::api::ensure_device_group_access(
+                        &state.pool,
+                        auth.user.organization_id,
+                        auth.user.id,
+                        &auth.user.role,
+                        did,
+                        false,
+                    )
                     .await?;
+                    let kind = args
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("metrics");
+                    let val =
+                        dispatch_agent_rpc(&state, auth.user.organization_id, did, 18, |rid| {
+                            ServerToAgentMessage::RunDiagnostic {
+                                request_id: rid,
+                                kind: kind.into(),
+                            }
+                        })
+                        .await?;
                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }] })
                 }
                 _ => return Err(ApiError::bad_request("unknown MCP tool")),
@@ -1038,7 +2293,9 @@ pub async fn create_calendar_event(
     .await?;
 
     if conflict_count > 0 {
-        return Err(ApiError::conflict("conflicto de horario: ya existe una cita programada en ese rango"));
+        return Err(ApiError::conflict(
+            "conflicto de horario: ya existe una cita programada en ese rango",
+        ));
     }
 
     let id = Uuid::new_v4();
@@ -1096,10 +2353,12 @@ pub async fn list_ticket_comments(
     let rows = sqlx::query(
         "SELECT id, ticket_id, author_name, is_internal, body, created_at
          FROM ticket_comments WHERE ticket_id = $1 AND organization_id = $2
+           AND (is_internal = false OR $3 NOT IN ('client', 'auditor'))
          ORDER BY created_at ASC",
     )
     .bind(ticket_id)
     .bind(auth.user.organization_id)
+    .bind(&auth.user.role)
     .fetch_all(&state.pool)
     .await?;
 
@@ -1123,6 +2382,28 @@ pub async fn create_ticket_comment(
     Path(ticket_id): Path<Uuid>,
     Json(req): Json<CreateTicketCommentRequest>,
 ) -> Result<Json<TicketCommentDto>, ApiError> {
+    if req.is_internal && matches!(auth.user.role.as_str(), "client" | "auditor") {
+        return Err(ApiError::forbidden(
+            "role cannot create internal ticket comments",
+        ));
+    }
+    let body = req.body.trim();
+    if body.is_empty() || body.chars().count() > 4000 {
+        return Err(ApiError::bad_request(
+            "comment must contain 1 to 4000 characters",
+        ));
+    }
+    let ticket_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM support_requests WHERE id = $1 AND organization_id = $2)",
+    )
+    .bind(ticket_id)
+    .bind(auth.user.organization_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if !ticket_exists {
+        return Err(ApiError::not_found("ticket not found in organization"));
+    }
+
     let cid = Uuid::new_v4();
     let row = sqlx::query(
         "INSERT INTO ticket_comments (id, organization_id, ticket_id, author_id, author_name, is_internal, body)
@@ -1135,16 +2416,33 @@ pub async fn create_ticket_comment(
     .bind(auth.user.id)
     .bind(&auth.user.display_name)
     .bind(req.is_internal)
-    .bind(req.body.trim())
+    .bind(body)
     .fetch_one(&state.pool)
     .await?;
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        if req.is_internal {
+            "ticket.internal_comment_created"
+        } else {
+            "ticket.comment_created"
+        },
+        "support_request",
+        &ticket_id.to_string(),
+        "success",
+        json!({ "comment_id": cid, "body_length": body.chars().count() }),
+    )
+    .await;
 
     Ok(Json(TicketCommentDto {
         id: cid,
         ticket_id,
         author_name: auth.user.display_name,
         is_internal: req.is_internal,
-        body: req.body.trim().to_string(),
+        body: body.to_string(),
         created_at: row.get("created_at"),
     }))
 }
@@ -1156,11 +2454,16 @@ pub async fn export_sessions_csv(
     let rows = sqlx::query(
         "SELECT s.id, d.hostname, d.public_code, s.caller_label, s.allow_control, s.status, s.created_at, s.started_at, s.ended_at
          FROM remote_sessions s
-         JOIN devices d ON d.id = s.device_id
+         JOIN devices d ON d.id = s.device_id AND d.organization_id = s.organization_id
+         LEFT JOIN device_groups g ON g.id = d.group_id AND g.organization_id = d.organization_id
+         LEFT JOIN device_group_shares shares ON shares.group_id = g.id AND shares.user_id = $2
          WHERE s.organization_id = $1
+           AND (d.group_id IS NULL OR g.owner_user_id = $2 OR shares.user_id IS NOT NULL OR $3 IN ('instance_admin', 'admin', 'org_admin'))
          ORDER BY s.created_at DESC LIMIT 500",
     )
     .bind(auth.user.organization_id)
+    .bind(auth.user.id)
+    .bind(&auth.user.role)
     .fetch_all(&state.pool)
     .await?;
 
@@ -1199,9 +2502,7 @@ pub async fn export_sessions_csv(
         .into_response())
 }
 
-pub async fn list_docs(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<DocPageDto>>, ApiError> {
+pub async fn list_docs(State(state): State<AppState>) -> Result<Json<Vec<DocPageDto>>, ApiError> {
     let rows = sqlx::query(
         "SELECT slug, title, body_markdown, updated_at FROM doc_pages ORDER BY slug ASC",
     )
@@ -1318,12 +2619,12 @@ pub async fn list_groups(
     let rows = sqlx::query(
         "SELECT g.id, g.organization_id, g.name, g.description, g.owner_user_id, g.created_at,
                 u.email AS owner_email, s.permission AS share_perm,
-                (SELECT COUNT(*) FROM address_book_entries a WHERE a.group_id = g.id) AS device_count
+                (SELECT COUNT(*) FROM devices d WHERE d.group_id = g.id AND d.organization_id = g.organization_id) AS device_count
          FROM device_groups g
-         JOIN users u ON u.id = g.owner_user_id
+         LEFT JOIN users u ON u.id = g.owner_user_id
          LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
          WHERE g.organization_id = $1
-           AND (g.owner_user_id = $2 OR s.user_id IS NOT NULL OR $3 IN ('admin', 'org_admin'))
+           AND (g.owner_user_id = $2 OR s.user_id IS NOT NULL OR $3 IN ('instance_admin', 'admin', 'org_admin'))
          ORDER BY g.name ASC",
     )
     .bind(auth.user.organization_id)
@@ -1335,13 +2636,14 @@ pub async fn list_groups(
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let gid: Uuid = r.get("id");
-        let owner_id: Uuid = r.get("owner_user_id");
+        let owner_id: Option<Uuid> = r.get("owner_user_id");
         let share_perm: Option<String> = r.get("share_perm");
-        let my_permission = if owner_id == auth.user.id || crate::state::is_admin_role(&auth.user.role) {
-            "full_control".to_string()
-        } else {
-            share_perm.unwrap_or_else(|| "read_only".to_string())
-        };
+        let my_permission =
+            if owner_id == Some(auth.user.id) || crate::state::is_admin_role(&auth.user.role) {
+                "full_control".to_string()
+            } else {
+                share_perm.unwrap_or_else(|| "read_only".to_string())
+            };
         let shares = fetch_group_shares(&state.pool, gid).await?;
         out.push(agentdesk_protocol::DeviceGroupDto {
             id: gid,
@@ -1349,7 +2651,9 @@ pub async fn list_groups(
             name: r.get("name"),
             description: r.get("description"),
             owner_user_id: owner_id,
-            owner_email: r.get("owner_email"),
+            owner_email: r
+                .get::<Option<String>, _>("owner_email")
+                .unwrap_or_default(),
             my_permission,
             device_count: r.get("device_count"),
             shares,
@@ -1407,11 +2711,115 @@ pub async fn create_group(
         organization_id: auth.user.organization_id,
         name: name.to_string(),
         description: req.description.trim().to_string(),
-        owner_user_id: auth.user.id,
+        owner_user_id: Some(auth.user.id),
         owner_email: auth.user.email.clone(),
         my_permission: "full_control".to_string(),
         device_count: 0,
         shares: vec![],
+        created_at: row.get("created_at"),
+    }))
+}
+
+pub async fn update_group(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<Uuid>,
+    Json(req): Json<agentdesk_protocol::UpdateDeviceGroupMetaRequest>,
+) -> Result<Json<agentdesk_protocol::DeviceGroupDto>, ApiError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("El nombre del grupo es obligatorio"));
+    }
+    let desc = req.description.trim();
+
+    let row = sqlx::query(
+        "SELECT g.owner_user_id, g.created_at, u.email AS owner_email, s.permission AS share_perm,
+                (SELECT COUNT(*) FROM devices d WHERE d.group_id = g.id AND d.organization_id = g.organization_id) AS device_count
+         FROM device_groups g
+         LEFT JOIN users u ON u.id = g.owner_user_id
+         LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
+         WHERE g.id = $1 AND g.organization_id = $3",
+    )
+    .bind(id)
+    .bind(auth.user.id)
+    .bind(auth.user.organization_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
+
+    let owner_id: Option<Uuid> = row.get("owner_user_id");
+    let share_perm: Option<String> = row.get("share_perm");
+    let is_owner_or_admin =
+        owner_id == Some(auth.user.id) || crate::state::is_admin_role(&auth.user.role);
+    let can_write = is_owner_or_admin
+        || matches!(
+            share_perm.as_deref(),
+            Some("read_write") | Some("full_control")
+        );
+    if !can_write {
+        return Err(ApiError::unauthorized(
+            "sin permiso de escritura sobre este grupo",
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE device_groups SET name = $2, description = $3 WHERE id = $1 AND organization_id = $4",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(desc)
+    .bind(auth.user.organization_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            ApiError::conflict("Ya existe un grupo con ese nombre")
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+
+    let _ = sqlx::query(
+        "UPDATE address_book_entries SET group_name = $2, updated_at = now()
+         WHERE group_id = $1 AND organization_id = $3",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(auth.user.organization_id)
+    .execute(&state.pool)
+    .await;
+
+    record_audit(
+        &state.pool,
+        Some(auth.user.organization_id),
+        Some(auth.user.id),
+        "user",
+        "group.updated",
+        "device_group",
+        &id.to_string(),
+        "success",
+        json!({ "name": name }),
+    )
+    .await;
+
+    let my_permission = if is_owner_or_admin {
+        "full_control".to_string()
+    } else {
+        share_perm.unwrap_or_else(|| "read_only".to_string())
+    };
+    let shares = fetch_group_shares(&state.pool, id).await?;
+    Ok(Json(agentdesk_protocol::DeviceGroupDto {
+        id,
+        organization_id: auth.user.organization_id,
+        name: name.to_string(),
+        description: desc.to_string(),
+        owner_user_id: owner_id,
+        owner_email: row
+            .get::<Option<String>, _>("owner_email")
+            .unwrap_or_default(),
+        my_permission,
+        device_count: row.get("device_count"),
+        shares,
         created_at: row.get("created_at"),
     }))
 }
@@ -1430,9 +2838,11 @@ pub async fn delete_group(
     .await?
     .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
 
-    let owner_id: Uuid = row.get("owner_user_id");
-    if owner_id != auth.user.id && !crate::state::is_admin_role(&auth.user.role) {
-        return Err(ApiError::unauthorized("solo el propietario o admin puede eliminar el grupo"));
+    let owner_id: Option<Uuid> = row.get("owner_user_id");
+    if owner_id != Some(auth.user.id) && !crate::state::is_admin_role(&auth.user.role) {
+        return Err(ApiError::unauthorized(
+            "solo el propietario o admin puede eliminar el grupo",
+        ));
     }
 
     sqlx::query("DELETE FROM device_groups WHERE id = $1")
@@ -1469,13 +2879,15 @@ pub async fn share_group(
     .await?
     .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
 
-    let owner_id: Uuid = grp.get("owner_user_id");
+    let owner_id: Option<Uuid> = grp.get("owner_user_id");
     let caller_perm: Option<String> = grp.get("caller_perm");
-    let allowed = owner_id == auth.user.id
+    let allowed = owner_id == Some(auth.user.id)
         || crate::state::is_admin_role(&auth.user.role)
         || caller_perm.as_deref() == Some("full_control");
     if !allowed {
-        return Err(ApiError::unauthorized("sin permisos para compartir este grupo"));
+        return Err(ApiError::unauthorized(
+            "sin permisos para compartir este grupo",
+        ));
     }
 
     let target = sqlx::query(
@@ -1544,13 +2956,15 @@ pub async fn unshare_group(
     .await?
     .ok_or_else(|| ApiError::not_found("grupo no encontrado"))?;
 
-    let owner_id: Uuid = grp.get("owner_user_id");
+    let owner_id: Option<Uuid> = grp.get("owner_user_id");
     let caller_perm: Option<String> = grp.get("caller_perm");
-    let allowed = owner_id == auth.user.id
+    let allowed = owner_id == Some(auth.user.id)
         || crate::state::is_admin_role(&auth.user.role)
         || caller_perm.as_deref() == Some("full_control");
     if !allowed {
-        return Err(ApiError::unauthorized("sin permisos para modificar este grupo"));
+        return Err(ApiError::unauthorized(
+            "sin permisos para modificar este grupo",
+        ));
     }
 
     sqlx::query("DELETE FROM device_group_shares WHERE group_id = $1 AND user_id = $2")
@@ -1576,12 +2990,15 @@ pub async fn assign_device(
         .collect::<String>()
         .to_uppercase();
     if norm_code.is_empty() {
-        return Err(ApiError::bad_request("Debe indicar el ID de conexión del equipo"));
+        return Err(ApiError::bad_request(
+            "Debe indicar el ID de conexión del equipo",
+        ));
     }
 
     let dev_row = sqlx::query(
         "SELECT id, organization_id, public_code, ed25519_pubkey, hostname, os_name, os_arch, agent_version,
-                kind, screen_width, screen_height, private_mem_mb, status, last_heartbeat_at, personal_password_hash, owner_user_id
+                kind, screen_width, screen_height, private_mem_mb, status, last_heartbeat_at, personal_password_hash, owner_user_id, group_id,
+                icon_kind, accent_color
          FROM devices
          WHERE organization_id = $1
            AND regexp_replace(UPPER(public_code), '[^A-Z0-9]', '', 'g') = $2
@@ -1596,7 +3013,12 @@ pub async fn assign_device(
     let device_id: Uuid = dev_row.get("id");
     let mut owner_email_out: Option<String> = None;
 
-    if let Some(em) = req.owner_email.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(em) = req
+        .owner_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let user_row = sqlx::query(
             "SELECT id, email FROM users WHERE organization_id = $1 AND LOWER(email) = LOWER($2)",
         )
@@ -1621,13 +3043,20 @@ pub async fn assign_device(
     }
 
     let mut entry_dto = None;
-    if req.group_id.is_some() || req.alias.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+    if req.group_id.is_some()
+        || req
+            .alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+    {
         let gname = if let Some(gid) = req.group_id {
             let gn: Option<String> = sqlx::query_scalar(
                 "SELECT g.name FROM device_groups g
                  LEFT JOIN device_group_shares s ON s.group_id = g.id AND s.user_id = $2
                  WHERE g.id = $1 AND g.organization_id = $3
-                   AND (g.owner_user_id = $2 OR $4 IN ('admin', 'org_admin') OR s.permission IN ('read_write', 'full_control'))",
+                   AND (g.owner_user_id = $2 OR $4 IN ('instance_admin', 'admin', 'org_admin') OR s.permission IN ('read_write', 'full_control'))",
             )
             .bind(gid)
             .bind(auth.user.id)
@@ -1635,10 +3064,21 @@ pub async fn assign_device(
             .bind(&auth.user.role)
             .fetch_optional(&state.pool)
             .await?;
-            gn.ok_or_else(|| ApiError::unauthorized("Grupo no encontrado o sin permiso de escritura"))?
+            gn.ok_or_else(|| {
+                ApiError::unauthorized("Grupo no encontrado o sin permiso de escritura")
+            })?
         } else {
             "General".to_string()
         };
+
+        if let Some(group_id) = req.group_id {
+            sqlx::query("UPDATE devices SET group_id = $2 WHERE id = $1 AND organization_id = $3")
+                .bind(device_id)
+                .bind(group_id)
+                .bind(auth.user.organization_id)
+                .execute(&state.pool)
+                .await?;
+        }
 
         let hostname: String = dev_row.get("hostname");
         let alias = req
@@ -1648,7 +3088,12 @@ pub async fn assign_device(
             .filter(|s| !s.is_empty())
             .unwrap_or(&hostname)
             .to_string();
-        let notes = req.notes.as_deref().map(str::trim).unwrap_or("").to_string();
+        let notes = req
+            .notes
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
 
         let eid = Uuid::new_v4();
         sqlx::query(
@@ -1670,7 +3115,7 @@ pub async fn assign_device(
         let ar = sqlx::query(
             "SELECT a.id, a.organization_id, a.device_id, a.group_id, a.alias, a.client_company, a.contact_name,
                     a.contact_email, a.group_name, a.is_favorite, a.notes, a.scheduled_next_at,
-                    a.created_at, a.updated_at,
+                    a.created_at, a.updated_at, a.icon_kind, a.accent_color,
                     d.public_code AS device_public_code, d.hostname AS device_hostname,
                     d.status AS device_status, d.os_name AS device_os, d.last_heartbeat_at AS device_last_heartbeat
              FROM address_book_entries a
@@ -1701,6 +3146,8 @@ pub async fn assign_device(
             device_status: ar.get("device_status"),
             device_os: ar.get("device_os"),
             device_last_heartbeat: ar.get("device_last_heartbeat"),
+            icon_kind: ar.get("icon_kind"),
+            accent_color: ar.get("accent_color"),
         });
     }
 
@@ -1719,10 +3166,15 @@ pub async fn assign_device(
         private_mem_mb: dev_row.get("private_mem_mb"),
         status: dev_row.get("status"),
         last_heartbeat_at: dev_row.get("last_heartbeat_at"),
+        group_id: req.group_id.or_else(|| dev_row.get("group_id")),
         owner_email: owner_email_out,
         has_personal_password: dev_row
             .get::<Option<String>, _>("personal_password_hash")
             .is_some(),
+        icon_kind: dev_row.get("icon_kind"),
+        accent_color: dev_row.get("accent_color"),
+        mac_addresses: dev_row.try_get("mac_addresses").unwrap_or_default(),
+        lan_ips: dev_row.try_get("lan_ips").unwrap_or_default(),
     };
 
     record_audit(

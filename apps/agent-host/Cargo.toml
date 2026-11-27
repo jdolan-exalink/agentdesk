@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+quicksupport = []
+
 [[bin]]
 name = "agentdesk-host"
 path = "src/main.rs"
@@ -32,3 +36,6 @@ uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+[build-dependencies]
+embed-resource = "3"

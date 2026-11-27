@@ -1,14 +1,22 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
-use eframe::egui;
+use gpui_kit::assets::IconName;
+use gpui_kit::base::StyledExt;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::{Icon, Sizable, Theme, ThemeMode};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -17,6 +25,78 @@ use std::os::windows::process::CommandExt;
 const MAX_LOG_LINES: usize = 600;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Palette {
+    canvas: u32,
+    panel: u32,
+    raised: u32,
+    border: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+    active: u32,
+    success: u32,
+    warning: u32,
+    danger: u32,
+    sidebar_bg: u32,
+    sidebar_active: u32,
+    sidebar_text: u32,
+    sidebar_muted: u32,
+    badge_ok_bg: u32,
+    badge_ok_fg: u32,
+}
+
+const DARK: Palette = Palette {
+    canvas: 0x0E131D,
+    panel: 0x151B28,
+    raised: 0x1D2536,
+    border: 0x283247,
+    text: 0xEDF2F7,
+    muted: 0x94A3B8,
+    accent: 0x3B82F6,
+    active: 0x1E2F54,
+    success: 0x22B983,
+    warning: 0xF59E0B,
+    danger: 0xEF4444,
+    sidebar_bg: 0x0A1638,
+    sidebar_active: 0x1D4ED8,
+    sidebar_text: 0xF8FAFC,
+    sidebar_muted: 0x93A8D6,
+    badge_ok_bg: 0x123524,
+    badge_ok_fg: 0x34D399,
+};
+
+const LIGHT: Palette = Palette {
+    canvas: 0xFFFFFF,
+    panel: 0xF7F9FC,
+    raised: 0xEEF2F7,
+    border: 0xE2E8F0,
+    text: 0x111827,
+    muted: 0x64748B,
+    accent: 0x1D4ED8,
+    active: 0xEFF6FF,
+    success: 0x16A34A,
+    warning: 0xD97706,
+    danger: 0xDC2626,
+    sidebar_bg: 0x0E2A8A,
+    sidebar_active: 0x1E40AF,
+    sidebar_text: 0xFFFFFF,
+    sidebar_muted: 0xB8C7F0,
+    badge_ok_bg: 0xDCFCE7,
+    badge_ok_fg: 0x15803D,
+};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SavedWindowBounds {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    #[serde(default)]
+    maximized: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConsoleServerConfig {
@@ -42,32 +122,22 @@ struct ConsoleServerConfig {
     default_admin_name: String,
     #[serde(default = "default_admin_password")]
     default_admin_password: String,
+    #[serde(default = "default_true")]
+    dark_mode: bool,
+    #[serde(default)]
+    window_bounds: Option<SavedWindowBounds>,
 }
 
-fn default_bind_addr() -> String {
-    "0.0.0.0:8080".to_string()
-}
+fn default_bind_addr() -> String { "0.0.0.0:8080".into() }
 fn default_database_url() -> String {
-    "postgres://agentdesk:agentdesk_dev_pass@127.0.0.1:5432/agentdesk".to_string()
+    "postgres://agentdesk:agentdesk_dev_pass@127.0.0.1:5432/agentdesk".into()
 }
-fn default_true() -> bool {
-    true
-}
-fn default_org_name() -> String {
-    "AgentDesk".to_string()
-}
-fn default_org_slug() -> String {
-    "agentdesk".to_string()
-}
-fn default_admin_email() -> String {
-    "juan@dolan.com.ar".to_string()
-}
-fn default_admin_name() -> String {
-    "Juan Dolan".to_string()
-}
-fn default_admin_password() -> String {
-    "admin123".to_string()
-}
+fn default_true() -> bool { true }
+fn default_org_name() -> String { "AgentDesk".into() }
+fn default_org_slug() -> String { "agentdesk".into() }
+fn default_admin_email() -> String { "juan@dolan.com.ar".into() }
+fn default_admin_name() -> String { "Juan Dolan".into() }
+fn default_admin_password() -> String { "admin123".into() }
 
 impl Default for ConsoleServerConfig {
     fn default() -> Self {
@@ -75,7 +145,7 @@ impl Default for ConsoleServerConfig {
             bind_addr: default_bind_addr(),
             database_url: default_database_url(),
             artifacts_dir: exe_dir(),
-            bootstrap_token: Some("agentdesk-local-setup-2026".to_string()),
+            bootstrap_token: Some("agentdesk-local-setup-2026".into()),
             public_url: None,
             auto_seed_admin: true,
             default_org_name: default_org_name(),
@@ -83,6 +153,8 @@ impl Default for ConsoleServerConfig {
             default_admin_email: default_admin_email(),
             default_admin_name: default_admin_name(),
             default_admin_password: default_admin_password(),
+            dark_mode: true,
+            window_bounds: None,
         }
     }
 }
@@ -124,8 +196,7 @@ impl ConsoleServerConfig {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
 }
@@ -151,51 +222,61 @@ fn detect_lan_ip() -> Option<Ipv4Addr> {
     None
 }
 
-fn build_icon_rgba(online: bool) -> Vec<u8> {
-    let w = 32u32;
-    let h = 32u32;
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let idx = ((y * w + x) * 4) as usize;
-            let dx = (x as f32) - 15.5;
-            let dy = (y as f32) - 15.5;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist <= 14.5 {
-                // Deep blue rounded badge + white monitor glyph + status dot
-                let mut r = 37u8;
-                let mut g = 99u8;
-                let mut b = 235u8;
-                let in_screen = (7..=24).contains(&x) && (8..=19).contains(&y);
-                let in_inner = (9..=22).contains(&x) && (10..=17).contains(&y);
-                let in_stand = (13..=18).contains(&x) && (20..=23).contains(&y);
-                if (in_screen && !in_inner) || in_stand {
-                    r = 255;
-                    g = 255;
-                    b = 255;
-                }
-                // Status dot bottom-right
-                let sdx = (x as f32) - 24.5;
-                let sdy = (y as f32) - 24.5;
-                if (sdx * sdx + sdy * sdy).sqrt() <= 4.5 {
-                    if online {
-                        r = 34;
-                        g = 197;
-                        b = 94;
-                    } else {
-                        r = 245;
-                        g = 158;
-                        b = 11;
-                    }
-                }
-                rgba[idx] = r;
-                rgba[idx + 1] = g;
-                rgba[idx + 2] = b;
-                rgba[idx + 3] = 255;
+fn build_server_tray_rgba(online: bool) -> Vec<u8> {
+    let mut rgba = image::load_from_memory(include_bytes!("../../../logos/agentdesk-server-icono.png"))
+        .expect("logo AgentDesk Server válido")
+        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let status = if online {
+        image::Rgba([34, 197, 94, 255])
+    } else {
+        image::Rgba([245, 158, 11, 255])
+    };
+    for y in 20..30 {
+        for x in 20..30 {
+            let dx = x as f32 - 24.5;
+            let dy = y as f32 - 24.5;
+            if (dx * dx + dy * dy).sqrt() <= 4.5 {
+                rgba.put_pixel(x, y, status);
             }
         }
     }
-    rgba
+    rgba.into_raw()
+}
+
+fn load_brand_logo_image(png_bytes: &[u8]) -> Arc<RenderImage> {
+    let mut img_buf = image::load_from_memory(png_bytes)
+        .expect("logo AgentDesk Server válido")
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    for px in img_buf.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(img_buf)]))
+}
+
+fn apply_theme(cx: &mut App, mode: ThemeMode) {
+    Theme::change(mode, None, cx);
+    Theme::update(cx, |theme| {
+        theme.font_family = "Inter".into();
+        theme.font_size = px(14.);
+    });
+}
+
+fn open_url_shell(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let res = unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL)
+        };
+        if (res.0 as isize) <= 32 {
+            return Err(format!("ShellExecuteW devolvió {}", res.0 as isize));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -210,8 +291,14 @@ enum TrayAction {
 
 enum ConsoleEvent {
     LogLine(String),
+    InitialProbe {
+        process_online: bool,
+        ready: bool,
+    },
     HealthStatus {
+        process_online: bool,
         online: bool,
+        database_status: String,
         public_url: Option<String>,
         lan_ip: Option<String>,
     },
@@ -220,17 +307,20 @@ enum ConsoleEvent {
     Toast(String),
 }
 
-struct ServerConsoleApp {
-    rt: tokio::runtime::Runtime,
+struct ServerConsole {
+    brand_logo: Arc<RenderImage>,
     tx: Sender<ConsoleEvent>,
     rx: Receiver<ConsoleEvent>,
     cfg: ConsoleServerConfig,
     cfg_path: PathBuf,
-    port_input: String,
-    public_url_input: String,
+    port_input: Entity<InputState>,
+    public_url_input: Entity<InputState>,
+    show_network_cfg: bool,
 
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
+    process_online: bool,
     online: bool,
+    database_status: String,
     external_running: bool,
     lan_ip: Option<String>,
     public_url: String,
@@ -238,14 +328,27 @@ struct ServerConsoleApp {
     status_msg: String,
     logs: VecDeque<String>,
     last_poll: Instant,
-    allow_quit: bool,
     auto_started_once: bool,
+    hwnd: isize,
+    allow_quit: Arc<AtomicBool>,
 }
 
-impl ServerConsoleApp {
-    fn new(cc: &eframe::CreationContext<'_>, tx: Sender<ConsoleEvent>, rx: Receiver<ConsoleEvent>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+impl ServerConsole {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        tx: Sender<ConsoleEvent>,
+        rx: Receiver<ConsoleEvent>,
+        child: Arc<Mutex<Option<Child>>>,
+        hwnd: isize,
+        allow_quit: Arc<AtomicBool>,
+    ) -> Self {
         let (cfg, cfg_path) = ConsoleServerConfig::load_or_default();
+        apply_theme(
+            cx,
+            if cfg.dark_mode { ThemeMode::Dark } else { ThemeMode::Light },
+        );
+
         let lan_ip = detect_lan_ip().map(|ip| ip.to_string());
         let port = cfg.port();
         let public_url = cfg
@@ -257,28 +360,41 @@ impl ServerConsoleApp {
                 None => format!("http://127.0.0.1:{port}"),
             });
 
-        #[cfg(windows)]
-        spawn_windows_tray(cc.egui_ctx.clone(), tx.clone());
+        let port_str = port.to_string();
+        let pub_str = cfg.public_url.clone().unwrap_or_default();
+
+        let port_input = cx.new(|cx| InputState::new(window, cx).default_value(port_str));
+        let public_url_input = cx.new(|cx| {
+            let mut st = InputState::new(window, cx).placeholder("http://10.1.1.156:8080");
+            if !pub_str.is_empty() {
+                st = st.default_value(pub_str);
+            }
+            st
+        });
 
         let mut app = Self {
-            rt: tokio::runtime::Runtime::new().expect("tokio runtime"),
+            brand_logo: load_brand_logo_image(include_bytes!("../../../logos/agentdesk-server-icono.png")),
             tx,
             rx,
-            port_input: port.to_string(),
-            public_url_input: cfg.public_url.clone().unwrap_or_default(),
             cfg,
             cfg_path,
-            child: None,
+            port_input,
+            public_url_input,
+            show_network_cfg: false,
+            child,
+            process_online: false,
             online: false,
+            database_status: "Sin comprobar".into(),
             external_running: false,
             lan_ip,
             public_url,
-            firewall_status: "Sin verificar".into(),
+            firewall_status: "Verificando…".into(),
             status_msg: String::new(),
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
             last_poll: Instant::now() - Duration::from_secs(10),
-            allow_quit: false,
             auto_started_once: false,
+            hwnd,
+            allow_quit,
         };
 
         app.push_log(format!(
@@ -288,7 +404,29 @@ impl ServerConsoleApp {
         ));
         app.check_firewall_status();
         app.probe_and_autostart();
+
+        // Background pump: funciona incluso con la ventana minimizada a bandeja
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let keep = cx.update(|cx| {
+                let Some(ent) = weak.upgrade() else { return false };
+                ent.update(cx, |this, cx| this.process_events(cx));
+                true
+            });
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+
         app
+    }
+
+    fn palette(&self) -> Palette {
+        if self.cfg.dark_mode { DARK } else { LIGHT }
     }
 
     fn push_log(&mut self, line: String) {
@@ -300,11 +438,7 @@ impl ServerConsoleApp {
 
     fn server_binary_path(&self) -> Option<PathBuf> {
         let cand = exe_dir()?.join("agentdesk-server.exe");
-        if cand.exists() {
-            Some(cand)
-        } else {
-            None
-        }
+        if cand.exists() { Some(cand) } else { None }
     }
 
     fn find_installer_script(&self, name: &str) -> Option<PathBuf> {
@@ -323,40 +457,46 @@ impl ServerConsoleApp {
             }
         }
         let fallback = PathBuf::from(r"d:\DEVs\AgentDesk\installers\windows").join(name);
-        if fallback.exists() {
-            Some(fallback)
-        } else {
-            None
-        }
+        if fallback.exists() { Some(fallback) } else { None }
     }
 
     fn probe_and_autostart(&mut self) {
         let port = self.cfg.port();
-        let already_up = self.rt.block_on(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(800))
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_millis(900))
                 .build()
-                .ok()?;
-            client
-                .get(format!("http://127.0.0.1:{port}/health/ready"))
-                .send()
-                .await
-                .ok()
-                .filter(|r| r.status().is_success())
+                .ok();
+            let (proc_on, ready) = match client {
+                Some(c) => {
+                    let live = c
+                        .get(format!("http://127.0.0.1:{port}/health/live"))
+                        .send()
+                        .ok()
+                        .is_some_and(|r| r.status().is_success());
+                    if !live {
+                        (false, false)
+                    } else {
+                        let rd = c
+                            .get(format!("http://127.0.0.1:{port}/health/ready"))
+                            .send()
+                            .ok()
+                            .is_some_and(|r| r.status().is_success());
+                        (true, rd)
+                    }
+                }
+                None => (false, false),
+            };
+            let _ = tx.send(ConsoleEvent::InitialProbe {
+                process_online: proc_on,
+                ready,
+            });
         });
+    }
 
-        if already_up.is_some() {
-            self.online = true;
-            self.external_running = true;
-            self.auto_started_once = true;
-            self.push_log(format!(
-                "[console] Servidor detectado en puerto {port} (proceso externo o Servicio Windows)."
-            ));
-            self.poll_health();
-        } else if !self.auto_started_once {
-            self.auto_started_once = true;
-            self.start_local_server();
-        }
+    fn has_local_child(&self) -> bool {
+        self.child.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
     fn start_local_server(&mut self) {
@@ -372,7 +512,7 @@ impl ServerConsoleApp {
             self.cfg.artifacts_dir = exe_dir();
         }
         if let Err(e) = self.cfg.save(&self.cfg_path) {
-            self.push_log(format!("[warn] No se pudo guardar {}: {e}", self.cfg_path.display()));
+            self.push_log(format!("[warn] No se pudo guardar config: {e}"));
         }
 
         let mut cmd = Command::new(&server_exe);
@@ -388,8 +528,7 @@ impl ServerConsoleApp {
                 if let Some(stdout) = child.stdout.take() {
                     let tx = self.tx.clone();
                     std::thread::spawn(move || {
-                        let reader = BufReader::new(stdout);
-                        for line in reader.lines().map_while(Result::ok) {
+                        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                             let _ = tx.send(ConsoleEvent::LogLine(line));
                         }
                     });
@@ -397,14 +536,16 @@ impl ServerConsoleApp {
                 if let Some(stderr) = child.stderr.take() {
                     let tx = self.tx.clone();
                     std::thread::spawn(move || {
-                        let reader = BufReader::new(stderr);
-                        for line in reader.lines().map_while(Result::ok) {
+                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                             let _ = tx.send(ConsoleEvent::LogLine(format!("[stderr] {line}")));
                         }
                     });
                 }
-                self.child = Some(child);
+                if let Ok(mut guard) = self.child.lock() {
+                    *guard = Some(child);
+                }
                 self.external_running = false;
+                self.process_online = true;
                 self.status_msg = "Servidor iniciado desde consola".into();
                 self.push_log(format!(
                     "[console] Iniciado {} --config {}",
@@ -421,10 +562,19 @@ impl ServerConsoleApp {
     }
 
     fn stop_local_child(&mut self) {
-        if let Some(mut c) = self.child.take() {
+        let taken = if let Ok(mut guard) = self.child.lock() {
+            guard.take()
+        } else {
+            None
+        };
+        if let Some(mut c) = taken {
             let _ = c.kill();
-            let _ = c.wait();
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            });
             self.online = false;
+            self.process_online = false;
+            self.database_status = "Sin comprobar".into();
             self.status_msg = "Servidor local detenido".into();
             self.push_log("[console] Proceso local de servidor detenido.".into());
         }
@@ -433,40 +583,45 @@ impl ServerConsoleApp {
     fn poll_health(&mut self) {
         let port = self.cfg.port();
         let tx = self.tx.clone();
-        self.rt.spawn(async move {
-            let client = reqwest::Client::builder()
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_default();
-            match client
-                .get(format!("http://127.0.0.1:{port}/health/ready"))
+            let process_online = client
+                .get(format!("http://127.0.0.1:{port}/health/live"))
                 .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
-                    let pub_url = body
-                        .get("public_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let lan = body
-                        .get("lan_ip")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let _ = tx.send(ConsoleEvent::HealthStatus {
-                        online: true,
-                        public_url: pub_url,
-                        lan_ip: lan,
-                    });
-                }
-                _ => {
-                    let _ = tx.send(ConsoleEvent::HealthStatus {
-                        online: false,
-                        public_url: None,
-                        lan_ip: None,
-                    });
-                }
-            }
+                .ok()
+                .is_some_and(|r| r.status().is_success());
+            let ready_resp = if process_online {
+                client
+                    .get(format!("http://127.0.0.1:{port}/health/ready"))
+                    .send()
+                    .ok()
+            } else {
+                None
+            };
+            let online = ready_resp.as_ref().is_some_and(|r| r.status().is_success());
+            let body = match ready_resp {
+                Some(r) if r.status().is_success() => r.json::<serde_json::Value>().unwrap_or_default(),
+                _ => serde_json::Value::Null,
+            };
+            let public_url = body.get("public_url").and_then(|v| v.as_str()).map(str::to_string);
+            let lan_ip = body.get("lan_ip").and_then(|v| v.as_str()).map(str::to_string);
+            let database_status = if online {
+                "Conectada"
+            } else if process_online {
+                "Sin conexión"
+            } else {
+                "Sin comprobar"
+            };
+            let _ = tx.send(ConsoleEvent::HealthStatus {
+                process_online,
+                online,
+                database_status: database_status.into(),
+                public_url,
+                lan_ip,
+            });
         });
     }
 
@@ -481,9 +636,7 @@ impl ServerConsoleApp {
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
             let status = match cmd.output() {
-                Ok(out) if out.status.success() => {
-                    format!("Regla activa: {rule}")
-                }
+                Ok(out) if out.status.success() => format!("Regla activa: {rule}"),
                 _ => format!("Falta regla '{rule}' (usar botón Firewall)"),
             };
             let _ = tx.send(ConsoleEvent::FirewallStatus(status));
@@ -502,10 +655,7 @@ impl ServerConsoleApp {
                     .as_ref()
                     .map(|b| format!("-BinaryPath '{}'", b.display()))
                     .unwrap_or_default();
-                format!(
-                    "& '{}' -Port {port} {bin_arg}",
-                    sp.display()
-                )
+                format!("& '{}' -Port {port} {bin_arg}", sp.display())
             } else {
                 let rule = format!("AgentDesk Server TCP {port}");
                 let app_cmd = bin
@@ -532,22 +682,14 @@ impl ServerConsoleApp {
             cmd.creation_flags(CREATE_NO_WINDOW);
             match cmd.status() {
                 Ok(s) if s.success() => {
-                    let _ = tx.send(ConsoleEvent::Toast(
-                        "Reglas de Firewall aplicadas correctamente".into(),
-                    ));
-                    let _ = tx.send(ConsoleEvent::FirewallStatus(format!(
-                        "Regla activa: AgentDesk Server TCP {port}"
-                    )));
+                    let _ = tx.send(ConsoleEvent::Toast("Reglas de Firewall aplicadas correctamente".into()));
+                    let _ = tx.send(ConsoleEvent::FirewallStatus(format!("Regla activa: AgentDesk Server TCP {port}")));
                 }
                 Ok(s) => {
-                    let _ = tx.send(ConsoleEvent::Toast(format!(
-                        "Firewall no actualizado (código {s})"
-                    )));
+                    let _ = tx.send(ConsoleEvent::Toast(format!("Firewall no actualizado (código {s})")));
                 }
                 Err(e) => {
-                    let _ = tx.send(ConsoleEvent::Toast(format!(
-                        "Error ejecutando PowerShell UAC: {e}"
-                    )));
+                    let _ = tx.send(ConsoleEvent::Toast(format!("Error ejecutando PowerShell UAC: {e}")));
                 }
             }
         });
@@ -566,12 +708,7 @@ impl ServerConsoleApp {
             .map(|b| format!("-BinaryPath '{}'", b.display()))
             .unwrap_or_default();
         std::thread::spawn(move || {
-            let inner = format!(
-                "& '{}' -BindAddr '{}' {}",
-                script.display(),
-                bind_addr,
-                bin_arg
-            );
+            let inner = format!("& '{}' -BindAddr '{}' {}", script.display(), bind_addr, bin_arg);
             let wrapped = format!(
                 "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-ExecutionPolicy','Bypass','-Command',\"{}\")",
                 inner.replace('"', "`\"")
@@ -582,42 +719,73 @@ impl ServerConsoleApp {
             cmd.creation_flags(CREATE_NO_WINDOW);
             match cmd.status() {
                 Ok(s) if s.success() => {
-                    let _ = tx.send(ConsoleEvent::Toast(
-                        "Servicio Windows 'AgentDeskServer' instalado e iniciado".into(),
-                    ));
+                    let _ = tx.send(ConsoleEvent::Toast("Servicio Windows 'AgentDeskServer' instalado e iniciado".into()));
                 }
                 Ok(s) => {
-                    let _ = tx.send(ConsoleEvent::Toast(format!(
-                        "Instalador de servicio finalizó con código {s}"
-                    )));
+                    let _ = tx.send(ConsoleEvent::Toast(format!("Instalador finalizó con código {s}")));
                 }
                 Err(e) => {
-                    let _ = tx.send(ConsoleEvent::Toast(format!(
-                        "Error lanzando UAC servicio: {e}"
-                    )));
+                    let _ = tx.send(ConsoleEvent::Toast(format!("Error UAC servicio: {e}")));
                 }
             }
         });
     }
 
-    fn open_web_portal(&self) {
+    fn open_web_portal(&mut self) {
         let url = format!("{}/app", self.public_url.trim_end_matches('/'));
+        let tx = self.tx.clone();
+        self.status_msg = format!("Abriendo portal: {url}");
+        std::thread::spawn(move || {
+            if let Err(e) = open_url_shell(&url) {
+                let _ = tx.send(ConsoleEvent::Toast(format!("Error abriendo portal: {e}")));
+            }
+        });
+    }
+
+    fn quit_all(&mut self) {
+        self.stop_local_child();
+        self.allow_quit.store(true, Ordering::Relaxed);
         #[cfg(windows)]
-        {
-            let _ = Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
+        unsafe {
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+            let _ = PostMessageW(HWND(self.hwnd as *mut _), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
 
-    fn process_events(&mut self, ctx: &egui::Context) {
-        if let Some(child) = &mut self.child {
-            if let Ok(Some(code)) = child.try_wait() {
-                self.push_log(format!("[console] Servidor finalizó con estado: {code}"));
-                self.child = None;
-                self.online = false;
+    fn hide_to_tray(&mut self, _cx: &mut App) {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+            let _ = ShowWindow(HWND(self.hwnd as *mut _), SW_HIDE);
+        }
+        self.status_msg = "Consola minimizada a Systray".into();
+        self.push_log("[tray] Consola oculta en bandeja del sistema.".into());
+    }
+
+    fn process_events(&mut self, cx: &mut Context<Self>) {
+        let mut dirty = false;
+
+        let exited = if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(code)) = child.try_wait() {
+                    *guard = None;
+                    Some(code)
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        if let Some(code) = exited {
+            self.push_log(format!("[console] Servidor finalizó con estado: {code}"));
+            self.online = false;
+            self.process_online = false;
+            dirty = true;
         }
 
         if self.last_poll.elapsed() >= Duration::from_secs(3) {
@@ -626,42 +794,70 @@ impl ServerConsoleApp {
         }
 
         while let Ok(ev) = self.rx.try_recv() {
+            dirty = true;
             match ev {
                 ConsoleEvent::LogLine(line) => self.push_log(line),
+                ConsoleEvent::InitialProbe { process_online, ready } => {
+                    let port = self.cfg.port();
+                    if process_online {
+                        self.process_online = true;
+                        self.online = ready;
+                        self.external_running = true;
+                        self.auto_started_once = true;
+                        self.database_status = if ready { "Conectada" } else { "Sin conexión" }.into();
+                        self.push_log(format!(
+                            "[console] Servidor detectado en puerto {port} (externo / Servicio Windows); PostgreSQL {}.",
+                            self.database_status.to_lowercase()
+                        ));
+                        self.poll_health();
+                    } else if !self.auto_started_once {
+                        self.auto_started_once = true;
+                        self.start_local_server();
+                    }
+                }
                 ConsoleEvent::HealthStatus {
+                    process_online,
                     online,
+                    database_status,
                     public_url,
                     lan_ip,
                 } => {
+                    self.process_online = process_online;
                     self.online = online;
-                    if let Some(url) = public_url {
-                        self.public_url = url;
+                    self.database_status = database_status;
+                    if let Some(u) = public_url {
+                        self.public_url = u;
                     }
                     if let Some(ip) = lan_ip {
                         self.lan_ip = Some(ip);
                     }
-                    if !online && self.child.is_none() {
+                    if !process_online && !self.has_local_child() {
                         self.external_running = false;
                     }
                 }
-                ConsoleEvent::FirewallStatus(msg) => {
-                    self.firewall_status = msg;
-                }
+                ConsoleEvent::FirewallStatus(msg) => self.firewall_status = msg,
                 ConsoleEvent::Toast(msg) => {
                     self.push_log(format!("[info] {msg}"));
                     self.status_msg = msg;
                 }
                 ConsoleEvent::Tray(action) => match action {
                     TrayAction::ShowWindow => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        #[cfg(windows)]
+                        unsafe {
+                            use windows::Win32::Foundation::HWND;
+                            use windows::Win32::UI::WindowsAndMessaging::{
+                                SetForegroundWindow, ShowWindow, SW_RESTORE,
+                            };
+                            let h = HWND(self.hwnd as *mut _);
+                            let _ = ShowWindow(h, SW_RESTORE);
+                            let _ = SetForegroundWindow(h);
+                        }
                     }
                     TrayAction::OpenPortal => self.open_web_portal(),
                     TrayAction::StartOrRestartServer => {
-                        if self.external_running && self.child.is_none() {
+                        if self.external_running && !self.has_local_child() {
                             self.push_log(
-                                "[warn] Hay un servidor externo corriendo (Servicio/daemon). Detén ese servicio primero o toma el control."
+                                "[warn] Servidor corriendo externamente (Servicio/daemon). Detenelo primero para controlarlo desde consola."
                                     .into(),
                             );
                         } else {
@@ -670,279 +866,550 @@ impl ServerConsoleApp {
                     }
                     TrayAction::StopServer => self.stop_local_child(),
                     TrayAction::AllowFirewall => self.allow_firewall_uac(),
-                    TrayAction::QuitAll => {
-                        self.stop_local_child();
-                        self.allow_quit = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                    TrayAction::QuitAll => self.quit_all(),
                 },
             }
         }
+
+        if dirty {
+            cx.notify();
+        }
+    }
+
+    fn btn(id: &'static str, label: impl Into<SharedString>, bg: u32, fg: u32) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .text_xs()
+            .font_semibold()
+            .child(label.into())
     }
 }
 
-impl eframe::App for ServerConsoleApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_events(ctx);
+impl Render for ServerConsole {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette();
+        let has_child = self.has_local_child();
+        let status_label = if self.process_online {
+            if self.online { "● OPERATIVO" } else { "● DEGRADADO" }
+        } else {
+            "● SERVIDOR DETENIDO"
+        };
+        let status_color = if self.process_online {
+            if self.online { p.success } else { p.warning }
+        } else {
+            p.muted
+        };
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.status_msg = "Consola minimizada a la bandeja del sistema (Systray)".into();
-            return;
-        }
-
-        ctx.request_repaint_after(Duration::from_millis(500));
-
-        egui::TopBottomPanel::top("srv_top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("AgentDesk Server Console");
-                ui.separator();
-                if self.online {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, "● EN LÍNEA");
-                    ui.label(if self.child.is_some() {
-                        "(Proceso consola)"
-                    } else {
-                        "(Externo / Servicio Windows)"
-                    });
-                } else {
-                    ui.colored_label(egui::Color32::YELLOW, "● DETENIDO");
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Salir y Detener").clicked() {
-                        self.stop_local_child();
-                        self.allow_quit = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ui.button("Ocultar a Systray").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    }
-                });
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("URL Pública (LAN):");
-                    ui.monospace(&self.public_url);
-                    if ui.button("Copiar URL").clicked() {
-                        ctx.copy_text(self.public_url.clone());
-                        self.status_msg = format!("URL copiada: {}", self.public_url);
-                    }
-                    if ui.button("Abrir Portal Web").clicked() {
-                        self.open_web_portal();
-                    }
-                    ui.separator();
-                    ui.label(format!(
-                        "IP LAN: {} | Local: http://127.0.0.1:{}",
-                        self.lan_ip.as_deref().unwrap_or("N/A"),
-                        self.cfg.port()
-                    ));
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Admin por defecto:");
-                    ui.monospace(format!(
-                        "{} / {}",
-                        self.cfg.default_admin_email, self.cfg.default_admin_password
-                    ));
-                    ui.separator();
-                    ui.strong("Firewall:");
-                    ui.label(&self.firewall_status);
-                });
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                if self.child.is_none() && !self.online {
-                    if ui.button("▶ Iniciar Servidor").clicked() {
-                        self.start_local_server();
-                    }
-                }
-                if self.child.is_some() {
-                    if ui.button("↻ Reiniciar Servidor").clicked() {
-                        self.start_local_server();
-                    }
-                    if ui.button("⏹ Detener Servidor").clicked() {
-                        self.stop_local_child();
-                    }
-                }
-                if ui.button("🛡 Permitir en Firewall (UAC)").clicked() {
-                    self.allow_firewall_uac();
-                }
-                if ui.button("⚙ Instalar Servicio Windows (UAC)").clicked() {
-                    self.install_service_uac();
-                }
-                if ui.button("⟳ Verificar estado").clicked() {
-                    self.check_firewall_status();
-                    self.poll_health();
-                }
-            });
-
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new("Configuración de Red y Publicación")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Puerto TCP:");
-                        ui.add(egui::TextEdit::singleline(&mut self.port_input).desired_width(80.0));
-                        ui.label("URL Pública (vacío = IP LAN automática):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.public_url_input)
-                                .hint_text("http://10.1.1.156:8080")
-                                .desired_width(260.0),
-                        );
-                        if ui.button("Guardar y aplicar").clicked() {
-                            let port: u16 = self.port_input.trim().parse().unwrap_or(8080);
-                            self.cfg.bind_addr = format!("0.0.0.0:{port}");
-                            self.cfg.public_url = if self.public_url_input.trim().is_empty() {
-                                None
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(p.canvas))
+            .text_color(rgb(p.text))
+            .child(
+                // Top Bar
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(54.))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
+                    .bg(rgb(p.panel))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        img(self.brand_logo.clone())
+                                            .size(px(32.))
+                                            .rounded_lg(),
+                                    )
+                                    .child(div().text_lg().font_semibold().child("AgentDesk Server")),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_full()
+                                    .bg(rgb(if self.online { p.badge_ok_bg } else { p.raised }))
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(rgb(if self.online { p.badge_ok_fg } else { status_color }))
+                                    .child(status_label),
+                            )
+                            .child(div().text_xs().text_color(rgb(p.muted)).child(if self.process_online {
+                                if has_child { "Proceso consola" } else { "Externo / Servicio Windows" }
                             } else {
-                                Some(
-                                    self.public_url_input
-                                        .trim()
-                                        .trim_end_matches('/')
-                                        .to_string(),
+                                "Detenido"
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(p.muted))
+                                    .child(format!("PostgreSQL: {}", self.database_status)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("srv-theme-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(34.))
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .cursor_pointer()
+                                    .bg(rgb(p.raised))
+                                    .text_color(rgb(p.text))
+                                    .hover(|s| s.bg(rgb(p.active)))
+                                    .child(Icon::new(IconName::SunMoon).size(px(19.)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cfg.dark_mode = !this.cfg.dark_mode;
+                                        let _ = this.cfg.save(&this.cfg_path);
+                                        apply_theme(
+                                            cx,
+                                            if this.cfg.dark_mode { ThemeMode::Dark } else { ThemeMode::Light },
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Self::btn("srv-hide-tray", "Ocultar a Systray", p.raised, p.text)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.hide_to_tray(cx);
+                                    })),
+                            )
+                            .child(
+                                Self::btn("srv-quit-stop", "Salir y Detener", p.danger, 0xFFFFFF)
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.quit_all();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                // Body: Left Sidebar actions + Right Dashboard & Logs
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        // Sidebar
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w(px(220.))
+                            .p_3()
+                            .gap_2()
+                            .bg(rgb(p.sidebar_bg))
+                            .text_color(rgb(p.sidebar_text))
+                            .child(div().text_xs().font_semibold().text_color(rgb(p.sidebar_muted)).child("CONTROL DEL SERVIDOR"))
+                            .when(!has_child && !self.process_online, |this| {
+                                this.child(
+                                    Self::btn("sb-start", "▶ Iniciar Servidor", p.sidebar_active, p.sidebar_text)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.start_local_server();
+                                            cx.notify();
+                                        })),
                                 )
-                            };
-                            let _ = self.cfg.save(&self.cfg_path);
-                            if self.child.is_some() {
-                                self.start_local_server();
-                            } else {
-                                self.status_msg = "Configuración guardada".into();
-                            }
-                        }
-                    });
-                    ui.small(format!("Archivo: {}", self.cfg_path.display()));
-                });
-
-            if !self.status_msg.is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_BLUE, &self.status_msg);
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("Consola de Logs en Vivo");
-                if ui.button("Limpiar").clicked() {
-                    self.logs.clear();
-                }
-                if ui.button("Copiar todo").clicked() {
-                    let joined = self.logs.iter().cloned().collect::<Vec<_>>().join("\n");
-                    ctx.copy_text(joined);
-                    self.status_msg = "Logs copiados al portapapeles".into();
-                }
-            });
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.logs {
-                        ui.monospace(line);
-                    }
-                });
-        });
+                            })
+                            .when(has_child, |this| {
+                                this.child(
+                                    Self::btn("sb-restart", "↻ Reiniciar Servidor", p.sidebar_active, p.sidebar_text)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.start_local_server();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Self::btn("sb-stop", "⏹ Detener Servidor", p.danger, 0xFFFFFF)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stop_local_child();
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                Self::btn("sb-portal", "Abrir Portal Web (/app)", p.sidebar_active, p.sidebar_text)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_web_portal();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Self::btn("sb-copy-url", "Copiar URL pública", p.sidebar_bg, p.sidebar_text)
+                                    .border_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            this.public_url.clone(),
+                                        ));
+                                        this.status_msg = format!("URL copiada: {}", this.public_url);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().pt_2().border_t_1().border_color(rgb(p.sidebar_active)).text_xs().font_semibold().text_color(rgb(p.sidebar_muted)).child("WINDOWS & RED"))
+                            .child(
+                                Self::btn("sb-fw", "Permitir Firewall (UAC)", p.sidebar_bg, p.sidebar_text)
+                                    .border_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.allow_firewall_uac();
+                                    })),
+                            )
+                            .child(
+                                Self::btn("sb-svc", "Instalar Servicio (UAC)", p.sidebar_bg, p.sidebar_text)
+                                    .border_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.install_service_uac();
+                                    })),
+                            )
+                            .child(
+                                Self::btn("sb-poll", "Verificar estado ahora", p.sidebar_bg, p.sidebar_text)
+                                    .border_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.check_firewall_status();
+                                        this.poll_health();
+                                    })),
+                            )
+                            .child(
+                                Self::btn("sb-netcfg", if self.show_network_cfg { "Ocultar Config Red" } else { "Configuración de Red" }, p.sidebar_bg, p.sidebar_text)
+                                    .border_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_network_cfg = !this.show_network_cfg;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .border_t_1()
+                                    .border_color(rgb(p.sidebar_active))
+                                    .text_xs()
+                                    .text_color(rgb(p.sidebar_muted))
+                                    .child(format!("Admin: {}", self.cfg.default_admin_email)),
+                            ),
+                    )
+                    .child(
+                        // Right Main Pane
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .p_4()
+                            .gap_3()
+                            .child(
+                                // Summary info card
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .p_4()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .bg(rgb(p.panel))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(p.muted)).child("URL Pública (LAN)"))
+                                            .child(div().font_semibold().text_color(rgb(p.accent)).child(self.public_url.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(p.muted)).child("IP LAN / Local"))
+                                            .child(div().text_sm().child(format!(
+                                                "{} | 127.0.0.1:{}",
+                                                self.lan_ip.as_deref().unwrap_or("N/A"),
+                                                self.cfg.port()
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(p.muted)).child("Firewall Windows"))
+                                            .child(div().text_sm().child(self.firewall_status.clone())),
+                                    ),
+                            )
+                            .when(self.show_network_cfg, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .p_4()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(p.border))
+                                        .bg(rgb(p.panel))
+                                        .child(div().font_semibold().text_sm().child("Configuración de Red y Publicación"))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Input::new(&self.port_input).w(px(100.)))
+                                                .child(Input::new(&self.public_url_input).flex_1())
+                                                .child(
+                                                    Self::btn("apply-net", "Guardar y aplicar", p.accent, 0xFFFFFF)
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            let port: u16 = this.port_input.read(cx).value().trim().parse().unwrap_or(8080);
+                                                            let pub_v = this.public_url_input.read(cx).value().trim().trim_end_matches('/').to_string();
+                                                            this.cfg.bind_addr = format!("0.0.0.0:{port}");
+                                                            this.cfg.public_url = if pub_v.is_empty() { None } else { Some(pub_v) };
+                                                            let _ = this.cfg.save(&this.cfg_path);
+                                                            if this.has_local_child() {
+                                                                this.start_local_server();
+                                                            } else {
+                                                                this.status_msg = "Configuración guardada".into();
+                                                            }
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(p.muted)).child(format!("Archivo: {}", self.cfg_path.display()))),
+                                )
+                            })
+                            .when(!self.status_msg.is_empty(), |this| {
+                                this.child(div().text_xs().text_color(rgb(p.accent)).child(self.status_msg.clone()))
+                            })
+                            .child(
+                                // Live Logs Panel
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p_4()
+                                    .gap_2()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .bg(rgb(p.panel))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(div().font_semibold().text_sm().child("Consola de Logs en Vivo"))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Self::btn("logs-clear", "Limpiar", p.raised, p.text)
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.logs.clear();
+                                                                cx.notify();
+                                                            })),
+                                                    )
+                                                    .child(
+                                                        Self::btn("logs-copy", "Copiar todo", p.raised, p.text)
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                let joined = this.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+                                                                cx.write_to_clipboard(ClipboardItem::new_string(joined));
+                                                                this.status_msg = "Logs copiados al portapapeles".into();
+                                                                cx.notify();
+                                                            })),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .p_3()
+                                            .rounded_md()
+                                            .bg(rgb(p.canvas))
+                                            .overflow_y_scrollbar()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .children(self.logs.iter().map(|line| {
+                                                div().text_xs().text_color(rgb(p.muted)).child(line.clone())
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
     }
 }
 
 #[cfg(windows)]
-fn spawn_windows_tray(ctx: egui::Context, tx: Sender<ConsoleEvent>) {
+fn focus_existing_window(title: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) } {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_windows_tray(
+    tx: Sender<ConsoleEvent>,
+    hwnd_val: isize,
+    tray_ok: Arc<AtomicBool>,
+    allow_quit: Arc<AtomicBool>,
+) {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+        DispatchMessageW, GetMessageW, PostMessageW, SetForegroundWindow, ShowWindow,
+        TranslateMessage, MSG, SW_RESTORE, WM_CLOSE,
     };
 
     std::thread::spawn(move || {
-        let menu = Menu::new();
-        let item_open = MenuItem::new("Abrir Consola AgentDesk", true, None);
-        let item_portal = MenuItem::new("Abrir Portal Web (LAN)", true, None);
-        let item_restart = MenuItem::new("Iniciar / Reiniciar Servidor", true, None);
-        let item_stop = MenuItem::new("Detener Servidor", true, None);
-        let item_fw = MenuItem::new("Configurar Firewall (UAC)", true, None);
-        let item_quit = MenuItem::new("Salir y Detener", true, None);
+        let mut built = None;
+        let mut last_err = String::new();
+        for attempt in 0..5 {
+            let menu = Menu::new();
+            let item_open = MenuItem::new("Abrir Consola AgentDesk", true, None);
+            let item_portal = MenuItem::new("Abrir Portal Web (LAN)", true, None);
+            let item_restart = MenuItem::new("Iniciar / Reiniciar Servidor", true, None);
+            let item_stop = MenuItem::new("Detener Servidor", true, None);
+            let item_fw = MenuItem::new("Configurar Firewall (UAC)", true, None);
+            let item_quit = MenuItem::new("Salir y Detener", true, None);
 
-        let _ = menu.append(&item_open);
-        let _ = menu.append(&item_portal);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&item_restart);
-        let _ = menu.append(&item_stop);
-        let _ = menu.append(&item_fw);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&item_quit);
+            let _ = menu.append(&item_open);
+            let _ = menu.append(&item_portal);
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            let _ = menu.append(&item_restart);
+            let _ = menu.append(&item_stop);
+            let _ = menu.append(&item_fw);
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            let _ = menu.append(&item_quit);
 
-        let id_open = item_open.id().clone();
-        let id_portal = item_portal.id().clone();
-        let id_restart = item_restart.id().clone();
-        let id_stop = item_stop.id().clone();
-        let id_fw = item_fw.id().clone();
-        let id_quit = item_quit.id().clone();
+            let id_open = item_open.id().clone();
+            let id_portal = item_portal.id().clone();
+            let id_restart = item_restart.id().clone();
+            let id_stop = item_stop.id().clone();
+            let id_fw = item_fw.id().clone();
+            let id_quit = item_quit.id().clone();
 
-        let rgba = build_icon_rgba(true);
-        let icon = match tray_icon::Icon::from_rgba(rgba, 32, 32) {
-            Ok(i) => i,
-            Err(_) => return,
-        };
-
-        let _tray = match TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("AgentDesk Server Console")
-            .with_icon(icon)
-            .build()
-        {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-
-        let tx_ev = tx.clone();
-        let ctx_ev = ctx.clone();
-        std::thread::spawn(move || loop {
-            let mut woke = false;
-            while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                woke = true;
-                let action = if ev.id == id_open {
-                    Some(TrayAction::ShowWindow)
-                } else if ev.id == id_portal {
-                    Some(TrayAction::OpenPortal)
-                } else if ev.id == id_restart {
-                    Some(TrayAction::StartOrRestartServer)
-                } else if ev.id == id_stop {
-                    Some(TrayAction::StopServer)
-                } else if ev.id == id_fw {
-                    Some(TrayAction::AllowFirewall)
-                } else if ev.id == id_quit {
-                    Some(TrayAction::QuitAll)
-                } else {
-                    None
-                };
-                if let Some(act) = action {
-                    let _ = tx_ev.send(ConsoleEvent::Tray(act));
+            let Ok(icon) = tray_icon::Icon::from_rgba(build_server_tray_rgba(true), 32, 32) else {
+                let _ = tx.send(ConsoleEvent::LogLine("[tray] No se pudo crear el ícono de systray.".into()));
+                return;
+            };
+            match TrayIconBuilder::new()
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .with_tooltip("AgentDesk Server Console")
+                .with_icon(icon)
+                .build()
+            {
+                Ok(t) => {
+                    built = Some((t, id_open, id_portal, id_restart, id_stop, id_fw, id_quit));
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < 4 {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                 }
             }
-            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click {
+        }
+        let Some((_tray, id_open, id_portal, id_restart, id_stop, id_fw, id_quit)) = built else {
+            let _ = tx.send(ConsoleEvent::LogLine(format!(
+                "[tray] No se pudo registrar ícono en systray: {last_err}"
+            )));
+            return;
+        };
+        tray_ok.store(true, Ordering::Relaxed);
+        let _ = tx.send(ConsoleEvent::LogLine("[tray] Ícono de systray registrado.".into()));
+
+        let menu_tx = tx.clone();
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            let hwnd = HWND(hwnd_val as *mut _);
+            if ev.id == id_open {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::ShowWindow));
+            } else if ev.id == id_portal {
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::OpenPortal));
+            } else if ev.id == id_restart {
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::StartOrRestartServer));
+            } else if ev.id == id_stop {
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::StopServer));
+            } else if ev.id == id_fw {
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::AllowFirewall));
+            } else if ev.id == id_quit {
+                allow_quit.store(true, Ordering::Relaxed);
+                let _ = menu_tx.send(ConsoleEvent::Tray(TrayAction::QuitAll));
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }));
+
+        TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
+            if matches!(
+                ev,
+                TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
                     ..
-                }
-                | TrayIconEvent::DoubleClick {
+                } | TrayIconEvent::DoubleClick {
                     button: MouseButton::Left,
                     ..
-                } = ev
-                {
-                    woke = true;
-                    let _ = tx_ev.send(ConsoleEvent::Tray(TrayAction::ShowWindow));
+                }
+            ) {
+                let hwnd = HWND(hwnd_val as *mut _);
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
                 }
             }
-            if woke {
-                ctx_ev.request_repaint();
-            }
-            std::thread::sleep(Duration::from_millis(80));
-        });
+        }));
 
         unsafe {
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -951,14 +1418,22 @@ fn spawn_windows_tray(ctx: egui::Context, tx: Sender<ConsoleEvent>) {
 }
 
 #[cfg(windows)]
-fn show_error_box(title: &str, body: &str) {
+fn acquire_single_instance() -> Result<Option<windows::Win32::Foundation::HANDLE>, String> {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-    let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let b: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        MessageBoxW(None, PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\AgentDesk.ServerConsole.Instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
+        .map_err(|e| format!("CreateMutexW error: {e}"))?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { let _ = CloseHandle(handle); }
+        focus_existing_window("AgentDesk Server Console");
+        return Ok(None);
     }
+    Ok(Some(handle))
 }
 
 fn init_console_logging() {
@@ -969,15 +1444,8 @@ fn init_console_logging() {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        let _ = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(Mutex::new(file))
-            .try_init();
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = tracing_subscriber::fmt().with_ansi(false).with_writer(Mutex::new(file)).try_init();
     } else {
         let _ = tracing_subscriber::fmt().with_ansi(false).try_init();
     }
@@ -986,50 +1454,168 @@ fn init_console_logging() {
 fn main() {
     init_console_logging();
 
+    #[cfg(windows)]
+    let _guard = match acquire_single_instance() {
+        Ok(Some(h)) => h,
+        Ok(None) => return,
+        Err(_) => return,
+    };
+
     let (tx, rx) = mpsc::channel();
-    let icon = egui::IconData {
-        rgba: build_icon_rgba(true),
-        width: 32,
-        height: 32,
-    };
-
-    let make_opts = |renderer: eframe::Renderer| eframe::NativeOptions {
-        renderer,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 620.0])
-            .with_title("AgentDesk — Consola del Servidor")
-            .with_icon(icon.clone())
-            .with_active(true),
-        ..Default::default()
-    };
-
-    let tx_clone = tx.clone();
-    let mut rx_opt = Some(rx);
-    let res = eframe::run_native(
-        "AgentDesk Server Console",
-        make_opts(eframe::Renderer::Glow),
-        Box::new(move |cc| {
-            let rx_take = rx_opt.take().expect("single init");
-            Ok(Box::new(ServerConsoleApp::new(cc, tx_clone, rx_take)))
-        }),
-    );
-
-    if let Err(glow_err) = res {
-        tracing::warn!(error = %glow_err, "Glow renderer failed, falling back to Wgpu");
-        let (tx2, rx2) = mpsc::channel();
-        let mut rx2_opt = Some(rx2);
-        if let Err(wgpu_err) = eframe::run_native(
-            "AgentDesk Server Console",
-            make_opts(eframe::Renderer::Wgpu),
-            Box::new(move |cc| {
-                let rx_take = rx2_opt.take().expect("single init");
-                Ok(Box::new(ServerConsoleApp::new(cc, tx2, rx_take)))
-            }),
-        ) {
-            let msg = format!("Glow error: {glow_err}\nWgpu error: {wgpu_err}");
-            tracing::error!("{msg}");
-            #[cfg(windows)]
-            show_error_box("Error iniciando AgentDesk Server Console", &msg);
+    let shared_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let child_cleanup = shared_child.clone();
+    let (init_cfg, _) = ConsoleServerConfig::load_or_default();
+    let init_bounds = if let Some(sb) = init_cfg.window_bounds {
+        if sb.width >= 640.0
+            && sb.height >= 460.0
+            && sb.x > -3000.0
+            && sb.y > -3000.0
+            && sb.x < 8000.0
+            && sb.y < 5000.0
+        {
+            let b = Bounds {
+                origin: point(px(sb.x), px(sb.y)),
+                size: size(px(sb.width), px(sb.height)),
+            };
+            if sb.maximized {
+                WindowBounds::Maximized(b)
+            } else {
+                WindowBounds::Windowed(b)
+            }
+        } else {
+            WindowBounds::Windowed(Bounds {
+                origin: point(px(120.), px(90.)),
+                size: size(px(940.), px(620.)),
+            })
         }
-    }
+    } else {
+        WindowBounds::Windowed(Bounds {
+            origin: point(px(120.), px(90.)),
+            size: size(px(940.), px(620.)),
+        })
+    };
+
+    application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            cx.text_system()
+                .add_fonts(vec![Cow::Borrowed(
+                    include_bytes!("../../desktop/assets/fonts/Inter.ttf").as_slice(),
+                )])
+                .expect("no se pudo cargar la fuente Inter");
+            apply_theme(cx, if init_cfg.dark_mode { ThemeMode::Dark } else { ThemeMode::Light });
+
+            let tx_win = tx.clone();
+            let mut rx_opt = Some(rx);
+            let child_win = shared_child.clone();
+
+            open_window(
+                WindowOptions {
+                    window_bounds: Some(init_bounds),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("AgentDesk Server Console".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| {
+                    let rx_take = rx_opt.take().expect("single init");
+                    let allow_quit = Arc::new(AtomicBool::new(false));
+                    let tray_ok = Arc::new(AtomicBool::new(false));
+                    let mut hwnd_val = 0isize;
+
+                    #[cfg(windows)]
+                    {
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        use windows::core::PCWSTR;
+                        use windows::Win32::Foundation::HWND;
+                        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+                        use windows::Win32::UI::WindowsAndMessaging::{
+                            LoadImageW, SendMessageW, SetClassLongPtrW, SetWindowTextW,
+                            GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+                            LR_DEFAULTCOLOR, WM_SETICON,
+                        };
+                        if let Ok(handle) = HasWindowHandle::window_handle(window) {
+                            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                                hwnd_val = h.hwnd.get() as isize;
+                                let title_wide: Vec<u16> = "AgentDesk Server Console"
+                                    .encode_utf16()
+                                    .chain(std::iter::once(0))
+                                    .collect();
+                                unsafe {
+                                    let _ = SetWindowTextW(
+                                        HWND(hwnd_val as *mut _),
+                                        PCWSTR(title_wide.as_ptr()),
+                                    );
+                                    if let Ok(hmod) = GetModuleHandleW(None) {
+                                        if let Ok(hbig) = LoadImageW(hmod, PCWSTR(1 as *const u16), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR) {
+                                            let _ = SendMessageW(HWND(hwnd_val as *mut _), WM_SETICON, windows::Win32::Foundation::WPARAM(ICON_BIG as usize), windows::Win32::Foundation::LPARAM(hbig.0 as isize));
+                                            let _ = SetClassLongPtrW(HWND(hwnd_val as *mut _), GCLP_HICON, hbig.0 as isize);
+                                        }
+                                        if let Ok(hsmall) = LoadImageW(hmod, PCWSTR(1 as *const u16), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR) {
+                                            let _ = SendMessageW(HWND(hwnd_val as *mut _), WM_SETICON, windows::Win32::Foundation::WPARAM(ICON_SMALL as usize), windows::Win32::Foundation::LPARAM(hsmall.0 as isize));
+                                            let _ = SetClassLongPtrW(HWND(hwnd_val as *mut _), GCLP_HICONSM, hsmall.0 as isize);
+                                        }
+                                    }
+                                }
+                                spawn_windows_tray(
+                                    tx_win.clone(),
+                                    hwnd_val,
+                                    tray_ok.clone(),
+                                    allow_quit.clone(),
+                                );
+                            }
+                        }
+                    }
+
+                    let root = cx.new(|cx| ServerConsole::new(window, cx, tx_win, rx_take, child_win, hwnd_val, allow_quit.clone()));
+                    let weak_root = root.downgrade();
+                    let aq = allow_quit.clone();
+                    let tok = tray_ok.clone();
+                    let ch = child_cleanup.clone();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        let (bounds, maximized) = match window.window_bounds() {
+                            WindowBounds::Windowed(b) => (b, false),
+                            WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => (b, true),
+                        };
+                        let x: f32 = bounds.origin.x.into();
+                        let y: f32 = bounds.origin.y.into();
+                        let width: f32 = bounds.size.width.into();
+                        let height: f32 = bounds.size.height.into();
+                        if width >= 240.0 && height >= 180.0 && x > -10000.0 && y > -10000.0 {
+                            let _ = weak_root.update(cx, |this, _| {
+                                this.cfg.window_bounds = Some(SavedWindowBounds {
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                    maximized,
+                                });
+                                let _ = this.cfg.save(&this.cfg_path);
+                            });
+                        }
+                        if aq.load(Ordering::Relaxed) || !tok.load(Ordering::Relaxed) {
+                            if let Ok(mut g) = ch.lock() {
+                                if let Some(mut c) = g.take() {
+                                    let _ = c.kill();
+                                    let _ = c.wait();
+                                }
+                            }
+                            return true;
+                        }
+                        #[cfg(windows)]
+                        unsafe {
+                            use windows::Win32::Foundation::HWND;
+                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                            let _ = ShowWindow(HWND(hwnd_val as *mut _), SW_HIDE);
+                        }
+                        false
+                    });
+                    root
+                },
+            )
+            .expect("no se pudo abrir AgentDesk Server Console");
+        });
 }

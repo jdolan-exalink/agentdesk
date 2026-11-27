@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub struct RelayRoom {
     pub host_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub viewer_tx: Option<mpsc::Sender<Vec<u8>>>,
+    pub pending_for_host: Vec<Vec<u8>>,
+    pub pending_for_viewer: Vec<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -169,6 +171,6 @@ pub async fn record_audit(
 
 /// Roles con privilegios de administración de la organización.
 pub fn is_admin_role(role: &str) -> bool {
-    matches!(role, "admin" | "org_admin")
+    matches!(role, "instance_admin" | "admin" | "org_admin")
 }
 

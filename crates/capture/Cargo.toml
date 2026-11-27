@@ -7,9 +7,12 @@ license.workspace = true
 [dependencies]
 agentdesk-protocol.workspace = true
 image.workspace = true
+jpeg-encoder.workspace = true
 lz4_flex.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+zune-jpeg.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

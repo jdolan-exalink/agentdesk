@@ -1,4 +1,4 @@
-﻿use crate::theme::ThemeMode;
+use crate::theme::ThemeMode;
 use serde::{Deserialize, Serialize};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,11 @@ pub struct ConnectionHistoryEntry {
 impl ConnectionHistoryEntry {
     pub fn is_trust_valid(&self, now_unix: i64) -> bool {
         let within_hour = (now_unix - self.last_connected_unix) < 3600;
-        let token_ok = self.reconnect_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        let token_ok = self
+            .reconnect_token
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
             && self.reconnect_expires_unix.unwrap_or(0) > now_unix;
         within_hour && token_ok
     }
@@ -42,15 +46,12 @@ pub struct DesktopConfig {
 
 impl Default for DesktopConfig {
     fn default() -> Self {
-        let server_url = match detect_lan_ip() {
-            Some(ip) => format!("http://{ip}:8080"),
-            None => "http://127.0.0.1:8080".to_string(),
-        };
+        let server_url = "https://agentdesk.dolan.com.ar".to_string();
         Self {
             server_url,
             last_email: String::new(),
             dark_mode: false,
-            theme: Some(ThemeMode::OpenVmsLight),
+            theme: Some(ThemeMode::System),
             connection_history: Vec::new(),
             owner_email: String::new(),
             personal_password_set: false,
@@ -170,7 +171,17 @@ pub fn set_windows_autostart(enabled: bool) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let val = format!("\"{}\"", exe.display());
         Command::new("reg.exe")
-            .args(["add", key, "/v", "AgentDeskDesktop", "/t", "REG_SZ", "/d", &val, "/f"])
+            .args([
+                "add",
+                key,
+                "/v",
+                "AgentDeskDesktop",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &val,
+                "/f",
+            ])
             .creation_flags(0x08000000)
             .output()
             .map_err(|e| e.to_string())?
@@ -195,7 +206,10 @@ pub fn set_windows_autostart(_enabled: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-pub fn install_host_service_elevated(server_url: &str, enroll_token: &str) -> Result<String, String> {
+pub fn install_host_service_elevated(
+    server_url: &str,
+    enroll_token: &str,
+) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
@@ -229,7 +243,13 @@ pub fn install_host_service_elevated(server_url: &str, enroll_token: &str) -> Re
         script_path.display().to_string().replace('\'', "''")
     );
     let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &launcher])
+        .args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &launcher,
+        ])
         .creation_flags(0x08000000)
         .output()
         .map_err(|e| e.to_string())?;
@@ -241,6 +261,9 @@ pub fn install_host_service_elevated(server_url: &str, enroll_token: &str) -> Re
 }
 
 #[cfg(not(windows))]
-pub fn install_host_service_elevated(_server_url: &str, _enroll_token: &str) -> Result<String, String> {
+pub fn install_host_service_elevated(
+    _server_url: &str,
+    _enroll_token: &str,
+) -> Result<String, String> {
     Err("Solo soportado en Windows".into())
 }

@@ -150,6 +150,8 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             notes: "Ventana mantenimiento 19h".into(),
             scheduled_next_at: None,
             group_id: None,
+            icon_kind: "desktop".into(),
+            accent_color: String::new(),
         })
         .send()
         .await

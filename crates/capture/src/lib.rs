@@ -1,8 +1,24 @@
-use agentdesk_protocol::{FrameEncoding, InputEvent, MonitorInfo, MouseBtn};
-use image::codecs::jpeg::JpegEncoder;
-use image::{ColorType, ImageReader};
-use std::io::Cursor;
+pub mod audio;
+pub mod h264;
+pub mod printing;
+pub mod stream;
+pub mod whiteboard;
+
+pub use audio::{spawn_audio_capture_worker, AudioPlayer};
+pub use h264::{MfH264Decoder, MfH264Encoder};
+pub use printing::{enumerate_printers, print_file_to_printer};
+pub use stream::{
+    h264_annexb_has_idr, FrameAdmission,
+    spawn_capture_worker, AbrController, HostStreamEncoder, StreamConfig, ViewerFrameCanvas,
+};
+pub use whiteboard::WhiteboardOverlay;
+
+use agentdesk_protocol::{CursorShape, FrameEncoding, InputEvent, MonitorInfo, MouseBtn};
+use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
 use thiserror::Error;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -50,20 +66,53 @@ pub fn encode_frame(
     jpeg_quality: u8,
 ) -> Result<Vec<u8>, CaptureError> {
     match encoding {
-        FrameEncoding::Jpeg => {
-            let mut rgb = Vec::with_capacity((frame.width * frame.height * 3) as usize);
-            for px in frame.rgba.chunks_exact(4) {
-                rgb.push(px[0]);
-                rgb.push(px[1]);
-                rgb.push(px[2]);
-            }
-            let mut out = Vec::with_capacity((frame.width * frame.height / 8) as usize);
-            let mut enc = JpegEncoder::new_with_quality(&mut out, jpeg_quality.clamp(20, 95));
-            enc.encode(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
-                .map_err(|e| CaptureError::Codec(e.to_string()))?;
+        FrameEncoding::Jpeg | FrameEncoding::HybridTiles => {
+            let mut out = Vec::with_capacity((frame.width * frame.height / 10) as usize);
+            let mut enc = JpegEncoder::new(&mut out, jpeg_quality.clamp(20, 95));
+            enc.set_sampling_factor(SamplingFactor::F_2_2);
+            enc.encode(
+                &frame.rgba,
+                frame.width.min(u16::MAX as u32) as u16,
+                frame.height.min(u16::MAX as u32) as u16,
+                JpegColorType::Rgba,
+            )
+            .map_err(|e| CaptureError::Codec(e.to_string()))?;
             Ok(out)
         }
         FrameEncoding::Lz4Rgba => Ok(lz4_flex::compress_prepend_size(&frame.rgba)),
+        FrameEncoding::H264AnnexB => Err(CaptureError::Codec(
+            "H264AnnexB requires MfH264Encoder".into(),
+        )),
+    }
+}
+
+pub fn decode_frame_to_bgra(
+    encoding: FrameEncoding,
+    payload: &[u8],
+) -> Result<(u32, u32, Vec<u8>), CaptureError> {
+    match encoding {
+        FrameEncoding::Jpeg => {
+            let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::BGRA);
+            let mut decoder = JpegDecoder::new_with_options(payload, options);
+            let bgra = decoder
+                .decode()
+                .map_err(|e| CaptureError::Codec(e.to_string()))?;
+            let info = decoder
+                .info()
+                .ok_or_else(|| CaptureError::Codec("missing JPEG dimensions".into()))?;
+            Ok((info.width as u32, info.height as u32, bgra))
+        }
+        FrameEncoding::Lz4Rgba => {
+            let mut raw = lz4_flex::decompress_size_prepended(payload)
+                .map_err(|e| CaptureError::Codec(e.to_string()))?;
+            for px in raw.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            Ok((0, 0, raw))
+        }
+        FrameEncoding::HybridTiles | FrameEncoding::H264AnnexB => {
+            Err(CaptureError::Codec("Frame encoding requires ViewerFrameCanvas".into()))
+        }
     }
 }
 
@@ -73,19 +122,24 @@ pub fn decode_frame_to_rgba(
 ) -> Result<(u32, u32, Vec<u8>), CaptureError> {
     match encoding {
         FrameEncoding::Jpeg => {
-            let img = ImageReader::new(Cursor::new(payload))
-                .with_guessed_format()
-                .map_err(|e| CaptureError::Codec(e.to_string()))?
+            let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+            let mut decoder = JpegDecoder::new_with_options(payload, options);
+            let rgba = decoder
                 .decode()
                 .map_err(|e| CaptureError::Codec(e.to_string()))?;
-            let rgba = img.to_rgba8();
-            Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+            let info = decoder
+                .info()
+                .ok_or_else(|| CaptureError::Codec("missing JPEG dimensions".into()))?;
+            Ok((info.width as u32, info.height as u32, rgba))
         }
         FrameEncoding::Lz4Rgba => {
             let raw = lz4_flex::decompress_size_prepended(payload)
                 .map_err(|e| CaptureError::Codec(e.to_string()))?;
             // Dimension is supplied in VideoFrame header by caller; return 0x0 marker here.
             Ok((0, 0, raw))
+        }
+        FrameEncoding::HybridTiles | FrameEncoding::H264AnnexB => {
+            Err(CaptureError::Codec("Frame encoding requires ViewerFrameCanvas".into()))
         }
     }
 }
@@ -109,12 +163,13 @@ pub mod win {
     };
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        SRCCOPY,
+        GetDIBits, GetSysColor, ReleaseDC, SelectObject, SetSysColors, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, COLOR_DESKTOP, DIB_RGB_COLORS, SRCCOPY,
     };
-    use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+    use windows::Win32::Foundation::{COLORREF, HANDLE, HGLOBAL};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::ProcessStatus::{
@@ -130,9 +185,16 @@ pub mod win {
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
         MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorInfo, GetSystemMetrics, LoadCursorW, SystemParametersInfoW, CURSORINFO,
+        CURSOR_SHOWING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
+        IDC_SIZEWE, IDC_WAIT, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETDESKWALLPAPER,
+        SPI_SETDESKWALLPAPER,
+    };
 
     const CF_UNICODETEXT_U32: u32 = 13;
+    const CF_HDROP_U32: u32 = 15;
 
     pub fn enumerate_monitors() -> Vec<MonitorInfo> {
         let mut out = Vec::new();
@@ -223,6 +285,8 @@ pub mod win {
         staging: ID3D11Texture2D,
         width: u32,
         height: u32,
+        origin_x: i32,
+        origin_y: i32,
         last_rgba: Vec<u8>,
     }
 
@@ -258,6 +322,15 @@ pub mod win {
                     .EnumOutputs(monitor_idx as u32)
                     .or_else(|_| adapter.EnumOutputs(0))
                     .map_err(|e| CaptureError::Backend(format!("EnumOutputs({monitor_idx}): {e}")))?;
+                let out_desc = output.GetDesc().ok();
+                let origin_x = out_desc
+                    .as_ref()
+                    .map(|d| d.DesktopCoordinates.left)
+                    .unwrap_or(0);
+                let origin_y = out_desc
+                    .as_ref()
+                    .map(|d| d.DesktopCoordinates.top)
+                    .unwrap_or(0);
                 let output1: IDXGIOutput1 = output
                     .cast()
                     .map_err(|e| CaptureError::Backend(format!("IDXGIOutput1: {e}")))?;
@@ -299,8 +372,75 @@ pub mod win {
                     staging,
                     width,
                     height,
+                    origin_x,
+                    origin_y,
                     last_rgba: vec![0u8; (width * height * 4) as usize],
                 })
+            }
+        }
+
+        /// Fast path for Level 1/2 streaming: returns `Ok(None)` immediately on timeout
+        /// or cursor-only updates without touching pixel memory, and copies BGRA rows
+        /// directly into `out_bgra` without any RGBA channel swap.
+        fn capture_bgra_if_changed(
+            &mut self,
+            timeout_ms: u32,
+            out_bgra: &mut Vec<u8>,
+        ) -> Result<Option<(u32, u32)>, CaptureError> {
+            unsafe {
+                let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource: Option<IDXGIResource> = None;
+                let hr = self.duplication.AcquireNextFrame(
+                    timeout_ms,
+                    &mut frame_info,
+                    &mut resource,
+                );
+                if let Err(e) = hr {
+                    if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                        return Ok(None);
+                    }
+                    if e.code() == DXGI_ERROR_ACCESS_LOST {
+                        return Err(CaptureError::Backend("DXGI_ERROR_ACCESS_LOST".into()));
+                    }
+                    return Err(CaptureError::Backend(format!("AcquireNextFrame: {e}")));
+                }
+
+                if frame_info.LastPresentTime == 0 && frame_info.TotalMetadataBufferSize == 0 {
+                    let _ = self.duplication.ReleaseFrame();
+                    return Ok(None);
+                }
+
+                let res = resource.ok_or_else(|| CaptureError::Backend("null resource".into()))?;
+                let tex: ID3D11Texture2D = res
+                    .cast()
+                    .map_err(|e| CaptureError::Backend(format!("cast texture: {e}")))?;
+
+                self.context.CopyResource(&self.staging, &tex);
+                let _ = self.duplication.ReleaseFrame();
+
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .map_err(|e| CaptureError::Backend(format!("Map staging: {e}")))?;
+
+                let row_pitch = mapped.RowPitch as usize;
+                let w = self.width as usize;
+                let h = self.height as usize;
+                let row_bytes = w * 4;
+                let src = std::slice::from_raw_parts(mapped.pData as *const u8, row_pitch * h);
+
+                out_bgra.resize(row_bytes * h, 0);
+                if row_pitch == row_bytes {
+                    out_bgra.copy_from_slice(&src[..row_bytes * h]);
+                } else {
+                    for y in 0..h {
+                        out_bgra[y * row_bytes..(y + 1) * row_bytes]
+                            .copy_from_slice(&src[y * row_pitch..y * row_pitch + row_bytes]);
+                    }
+                }
+                self.context.Unmap(&self.staging, 0);
+
+                Ok(Some((self.width, self.height)))
             }
         }
 
@@ -431,10 +571,64 @@ pub mod win {
         }
     }
 
+    fn capture_gdi_bgra_into(out_bgra: &mut Vec<u8>) -> Result<(u32, u32), CaptureError> {
+        unsafe {
+            let w = GetSystemMetrics(SM_CXSCREEN).max(1) as u32;
+            let h = GetSystemMetrics(SM_CYSCREEN).max(1) as u32;
+            let hdc_screen = GetDC(None);
+            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            let hbmp = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
+            let old = SelectObject(hdc_mem, hbmp);
+
+            let ok = BitBlt(hdc_mem, 0, 0, w as i32, h as i32, hdc_screen, 0, 0, SRCCOPY);
+            out_bgra.resize((w * h * 4) as usize, 0);
+
+            if ok.is_ok() {
+                let mut bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w as i32,
+                        biHeight: -(h as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                GetDIBits(
+                    hdc_mem,
+                    hbmp,
+                    0,
+                    h,
+                    Some(out_bgra.as_mut_ptr() as *mut _),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                );
+                for px in out_bgra.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+            }
+
+            SelectObject(hdc_mem, old);
+            let _ = DeleteObject(hbmp);
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(None, hdc_screen);
+
+            if ok.is_err() {
+                return Err(CaptureError::Backend("GDI BitBlt failed".into()));
+            }
+            Ok((w, h))
+        }
+    }
+
     pub struct WindowsCapturer {
         dxgi: Option<DxgiState>,
+        monitor_idx: usize,
         width: u32,
         height: u32,
+        origin_x: i32,
+        origin_y: i32,
         backend: CaptureBackend,
     }
 
@@ -447,12 +641,15 @@ pub mod win {
             attach_input_desktop();
             match DxgiState::new_for_monitor(monitor_idx) {
                 Ok(dx) => {
-                    let (w, h) = (dx.width, dx.height);
+                    let (w, h, ox, oy) = (dx.width, dx.height, dx.origin_x, dx.origin_y);
                     tracing::info!(width = w, height = h, monitor_idx, "DXGI Desktop Duplication initialized");
                     Self {
                         dxgi: Some(dx),
+                        monitor_idx,
                         width: w,
                         height: h,
+                        origin_x: ox,
+                        origin_y: oy,
                         backend: CaptureBackend::Dxgi,
                     }
                 }
@@ -466,8 +663,11 @@ pub mod win {
                     };
                     Self {
                         dxgi: None,
+                        monitor_idx,
                         width: w,
                         height: h,
+                        origin_x: 0,
+                        origin_y: 0,
                         backend: CaptureBackend::Gdi,
                     }
                 }
@@ -476,13 +676,90 @@ pub mod win {
 
         pub fn switch_monitor(&mut self, monitor_idx: usize) -> bool {
             if let Ok(dx) = DxgiState::new_for_monitor(monitor_idx) {
+                self.monitor_idx = monitor_idx;
                 self.width = dx.width;
                 self.height = dx.height;
+                self.origin_x = dx.origin_x;
+                self.origin_y = dx.origin_y;
                 self.dxgi = Some(dx);
                 self.backend = CaptureBackend::Dxgi;
                 true
             } else {
                 false
+            }
+        }
+
+        /// Level 1/2 fast capture: avoids pixel copying on unchanged DXGI frames and writes
+        /// native BGRA bytes directly into `out_bgra` without RGBA channel swapping.
+        pub fn capture_bgra_if_changed(
+            &mut self,
+            timeout_ms: u32,
+            out_bgra: &mut Vec<u8>,
+        ) -> Result<Option<(u32, u32)>, CaptureError> {
+            attach_input_desktop();
+            if let Some(dx) = &mut self.dxgi {
+                match dx.capture_bgra_if_changed(timeout_ms, out_bgra) {
+                    Ok(res) => return Ok(res),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DXGI fast capture lost, retrying re-init");
+                        if let Ok(mut fresh) = DxgiState::new_for_monitor(self.monitor_idx) {
+                            self.width = fresh.width;
+                            self.height = fresh.height;
+                            self.origin_x = fresh.origin_x;
+                            self.origin_y = fresh.origin_y;
+                            let res = fresh.capture_bgra_if_changed(timeout_ms, out_bgra);
+                            self.dxgi = Some(fresh);
+                            if let Ok(opt) = res {
+                                return Ok(opt);
+                            }
+                        }
+                        self.dxgi = None;
+                        self.backend = CaptureBackend::Gdi;
+                    }
+                }
+            }
+            capture_gdi_bgra_into(out_bgra).map(Some)
+        }
+
+        /// Reads the OS cursor position and standard system shape normalized to the active monitor.
+        pub fn capture_cursor_state(&self) -> Option<(f32, f32, bool, CursorShape)> {
+            unsafe {
+                let mut ci = CURSORINFO {
+                    cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetCursorInfo(&mut ci).is_err() {
+                    return None;
+                }
+                let visible = (ci.flags.0 & CURSOR_SHOWING.0) != 0;
+                let w = self.width.max(1) as f32;
+                let h = self.height.max(1) as f32;
+                let x_norm = ((ci.ptScreenPos.x - self.origin_x) as f32 / w).clamp(0.0, 1.0);
+                let y_norm = ((ci.ptScreenPos.y - self.origin_y) as f32 / h).clamp(0.0, 1.0);
+
+                let shape = if !visible {
+                    CursorShape::Hidden
+                } else if LoadCursorW(None, IDC_IBEAM).ok() == Some(ci.hCursor) {
+                    CursorShape::IBeam
+                } else if LoadCursorW(None, IDC_HAND).ok() == Some(ci.hCursor) {
+                    CursorShape::Hand
+                } else if LoadCursorW(None, IDC_WAIT).ok() == Some(ci.hCursor) {
+                    CursorShape::Wait
+                } else if LoadCursorW(None, IDC_SIZENS).ok() == Some(ci.hCursor) {
+                    CursorShape::SizeNS
+                } else if LoadCursorW(None, IDC_SIZEWE).ok() == Some(ci.hCursor) {
+                    CursorShape::SizeWE
+                } else if LoadCursorW(None, IDC_SIZEALL).ok() == Some(ci.hCursor) {
+                    CursorShape::SizeAll
+                } else if LoadCursorW(None, IDC_CROSS).ok() == Some(ci.hCursor) {
+                    CursorShape::Cross
+                } else if LoadCursorW(None, IDC_ARROW).ok() == Some(ci.hCursor) {
+                    CursorShape::Arrow
+                } else {
+                    CursorShape::Arrow
+                };
+
+                Some((x_norm, y_norm, visible, shape))
             }
         }
     }
@@ -695,6 +972,157 @@ pub mod win {
         }
     }
 
+    pub fn clipboard_sequence_number() -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    pub fn read_clipboard_files() -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return out;
+            }
+            if let Ok(handle) = GetClipboardData(CF_HDROP_U32) {
+                let hdrop = HDROP(handle.0);
+                let count = DragQueryFileW(hdrop, u32::MAX, None);
+                let mut total_bytes = 0u64;
+                for i in 0..count.min(32) {
+                    let needed = DragQueryFileW(hdrop, i, None);
+                    if needed > 0 && needed < 1024 {
+                        let mut buf = vec![0u16; needed as usize + 1];
+                        let copied = DragQueryFileW(hdrop, i, Some(&mut buf));
+                        if copied > 0 {
+                            let p = std::path::PathBuf::from(String::from_utf16_lossy(
+                                &buf[..copied as usize],
+                            ));
+                            if let Ok(meta) = std::fs::metadata(&p) {
+                                if meta.is_file()
+                                    && total_bytes.saturating_add(meta.len()) <= 64 * 1024 * 1024
+                                {
+                                    total_bytes += meta.len();
+                                    out.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = CloseClipboard();
+        }
+        out
+    }
+
+    pub fn write_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let mut wide_list: Vec<u16> = Vec::new();
+        for p in paths {
+            wide_list.extend(p.to_string_lossy().encode_utf16());
+            wide_list.push(0);
+        }
+        wide_list.push(0);
+
+        let header_size = std::mem::size_of::<DROPFILES>();
+        let total_bytes = header_size + wide_list.len() * std::mem::size_of::<u16>();
+        unsafe {
+            let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total_bytes) else {
+                return false;
+            };
+            let ptr = GlobalLock(hmem) as *mut u8;
+            if ptr.is_null() {
+                return false;
+            }
+            std::ptr::write_bytes(ptr, 0, total_bytes);
+            let df = DROPFILES {
+                pFiles: header_size as u32,
+                pt: Default::default(),
+                fNC: false.into(),
+                fWide: true.into(),
+            };
+            std::ptr::copy_nonoverlapping(&df as *const DROPFILES as *const u8, ptr, header_size);
+            std::ptr::copy_nonoverlapping(
+                wide_list.as_ptr() as *const u8,
+                ptr.add(header_size),
+                wide_list.len() * 2,
+            );
+            let _ = GlobalUnlock(hmem);
+
+            if OpenClipboard(None).is_err() {
+                return false;
+            }
+            let _ = EmptyClipboard();
+            let ok = SetClipboardData(CF_HDROP_U32, HANDLE(hmem.0)).is_ok();
+            let _ = CloseClipboard();
+            ok
+        }
+    }
+
+    /// Temporarily switches the Windows desktop background to solid black during an active
+    /// remote session for lower entropy/bandwidth and faster encoding, restoring on Drop.
+    pub struct WallpaperBlackoutGuard {
+        original_wallpaper: Vec<u16>,
+        original_color: u32,
+        active: bool,
+    }
+
+    impl WallpaperBlackoutGuard {
+        pub fn activate() -> Self {
+            unsafe {
+                let mut path_buf = vec![0u16; 520];
+                let got_wp = SystemParametersInfoW(
+                    SPI_GETDESKWALLPAPER,
+                    path_buf.len() as u32,
+                    Some(path_buf.as_mut_ptr() as *mut _),
+                    Default::default(),
+                )
+                .is_ok();
+                let orig_color = GetSysColor(COLOR_DESKTOP);
+
+                let empty: [u16; 1] = [0];
+                let _ = SystemParametersInfoW(
+                    SPI_SETDESKWALLPAPER,
+                    0,
+                    Some(empty.as_ptr() as *mut _),
+                    SPIF_SENDCHANGE,
+                );
+                let elem = [COLOR_DESKTOP.0];
+                let black = [COLORREF(0x0000_0000)];
+                let _ = SetSysColors(1, elem.as_ptr(), black.as_ptr());
+
+                if !got_wp {
+                    path_buf.clear();
+                }
+                Self {
+                    original_wallpaper: path_buf,
+                    original_color: orig_color,
+                    active: true,
+                }
+            }
+        }
+    }
+
+    impl Drop for WallpaperBlackoutGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            unsafe {
+                let elem = [COLOR_DESKTOP.0];
+                let cols = [COLORREF(self.original_color)];
+                let _ = SetSysColors(1, elem.as_ptr(), cols.as_ptr());
+                if !self.original_wallpaper.is_empty() {
+                    let _ = SystemParametersInfoW(
+                        SPI_SETDESKWALLPAPER,
+                        0,
+                        Some(self.original_wallpaper.as_ptr() as *mut _),
+                        SPIF_SENDCHANGE,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn current_process_private_mb() -> f64 {
         unsafe {
             let mut pmc = PROCESS_MEMORY_COUNTERS_EX::default();
@@ -727,6 +1155,17 @@ pub mod win {
         pub fn switch_monitor(&mut self, _idx: usize) -> bool {
             false
         }
+        pub fn capture_bgra_if_changed(
+            &mut self,
+            _timeout_ms: u32,
+            out_bgra: &mut Vec<u8>,
+        ) -> Result<Option<(u32, u32)>, CaptureError> {
+            out_bgra.resize(640 * 360 * 4, 32);
+            Ok(Some((640, 360)))
+        }
+        pub fn capture_cursor_state(&self) -> Option<(f32, f32, bool, CursorShape)> {
+            None
+        }
     }
     pub fn enumerate_monitors() -> Vec<MonitorInfo> {
         vec![MonitorInfo {
@@ -743,6 +1182,21 @@ pub mod win {
     }
     pub fn write_clipboard_text(_text: &str) -> bool {
         false
+    }
+    pub fn clipboard_sequence_number() -> u32 {
+        0
+    }
+    pub fn read_clipboard_files() -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    pub fn write_clipboard_files(_paths: &[std::path::PathBuf]) -> bool {
+        false
+    }
+    pub struct WallpaperBlackoutGuard;
+    impl WallpaperBlackoutGuard {
+        pub fn activate() -> Self {
+            Self
+        }
     }
     impl ScreenCapturer for WindowsCapturer {
         fn capture_rgba(&mut self) -> Result<RawFrame, CaptureError> {

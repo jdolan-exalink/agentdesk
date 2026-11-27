@@ -4,6 +4,7 @@ pub mod config;
 pub mod relay;
 pub mod rmm_ai_api;
 pub mod state;
+pub mod stun;
 pub mod web;
 
 use crate::state::AppState;
@@ -24,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/login", get(web::login_page))
         .route("/app", get(web::app_dashboard_page))
         // Health & Artifacts
+        .route("/health/live", get(api::health_live))
         .route("/health/ready", get(api::health_ready))
         .route("/api/v1/downloads", get(api::list_downloads))
         .route("/downloads/file/{filename}", get(api::download_artifact_file))
@@ -40,14 +42,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/devices/enroll", post(api::enroll_device))
         .route("/api/v1/devices/heartbeat", post(api::device_heartbeat))
         .route("/api/v1/devices/assign", post(rmm_ai_api::assign_device))
+        .route("/api/v1/devices/{id}/group", patch(api::update_device_group))
+        .route("/api/v1/devices/{id}/appearance", patch(api::update_device_appearance))
+        .route("/api/v1/devices/{id}/wol", post(api::wake_device))
         .route("/api/v1/devices", get(api::list_devices))
         .route("/api/v1/clients/register", post(api::quick_register_client))
+        .route("/api/v1/clients/lookup", get(api::lookup_client_by_id))
         .route("/api/v1/clients/password", post(api::rotate_client_password))
         .route("/api/v1/clients/personal-password", post(api::set_personal_password))
         .route("/api/v1/sessions/connect-by-id", post(api::connect_by_id))
         // Device Groups & Sharing
         .route("/api/v1/groups", get(rmm_ai_api::list_groups).post(rmm_ai_api::create_group))
-        .route("/api/v1/groups/{id}", delete(rmm_ai_api::delete_group))
+        .route("/api/v1/groups/{id}", patch(rmm_ai_api::update_group).delete(rmm_ai_api::delete_group))
         .route("/api/v1/groups/{id}/shares", post(rmm_ai_api::share_group))
         .route("/api/v1/groups/{id}/shares/{user_id}", delete(rmm_ai_api::unshare_group))
         // Address Book (Clientes Agendados)
@@ -63,6 +69,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tickets", get(api::list_tickets))
         .route("/api/v1/tickets/{id}/claim", post(api::claim_ticket))
         .route("/api/v1/tickets/{id}/close", post(api::close_ticket))
+        .route("/api/v1/tickets/{id}/resolve", post(api::resolve_ticket))
         // Remote Sessions
         .route("/api/v1/sessions", get(api::list_sessions).post(api::create_session))
         .route("/api/v1/sessions/{id}/terminate", post(api::terminate_session))
@@ -77,15 +84,24 @@ pub fn build_router(state: AppState) -> Router {
         // RMM Telemetry & Remote Terminal
         .route("/api/v1/devices/{id}/diagnostics", post(rmm_ai_api::run_device_diagnostic))
         .route("/api/v1/devices/{id}/telemetry", get(rmm_ai_api::list_device_telemetry))
+        .route("/api/v1/devices/{id}/alerts", get(rmm_ai_api::list_device_alerts))
+        .route("/api/v1/alerts/{id}/acknowledge", post(rmm_ai_api::acknowledge_device_alert))
+        .route("/api/v1/rmm/alert-settings", get(rmm_ai_api::get_rmm_alert_settings).put(rmm_ai_api::update_rmm_alert_settings))
         .route(
             "/api/v1/devices/{id}/command",
             get(rmm_ai_api::list_device_commands).post(rmm_ai_api::run_device_command),
         )
         // AI Copilot (ChatGPT OAuth PKCE / OpenAI / Ollama) & MCP
         .route("/api/v1/ai/settings", get(rmm_ai_api::get_ai_settings).put(rmm_ai_api::update_ai_settings))
+        .route("/api/v1/ai/models", get(rmm_ai_api::list_ai_models))
         .route("/api/v1/ai/oauth/start", get(rmm_ai_api::ai_oauth_start))
+        .route("/api/v1/ai/oauth/device/start", post(rmm_ai_api::ai_oauth_device_start))
         .route("/api/v1/ai/oauth/callback", get(rmm_ai_api::ai_oauth_callback))
+        .route("/api/v1/ai/oauth/complete", post(rmm_ai_api::ai_oauth_complete))
+        .route("/api/v1/ai/oauth/disconnect", post(rmm_ai_api::ai_oauth_disconnect))
         .route("/api/v1/ai/chat", post(rmm_ai_api::ai_chat))
+        .route("/api/v1/ai/sessions", get(rmm_ai_api::list_ai_chat_sessions))
+        .route("/api/v1/ai/sessions/{session_id}/messages", get(rmm_ai_api::list_ai_chat_messages))
         .route("/api/v1/ai/execute-action", post(rmm_ai_api::ai_execute_approved_action))
         .route("/api/v1/mcp", post(rmm_ai_api::mcp_rpc_handler))
         // Calendar, Ticket Comments, CSV Reports & Docs

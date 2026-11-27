@@ -1,0 +1,40 @@
+[package]
+name = "agentdesk-desktop-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentdesk-desktop-gpui"
+path = "src/main.rs"
+
+[dependencies]
+agentdesk-capture.workspace = true
+agentdesk-identity.workspace = true
+agentdesk-protocol.workspace = true
+agentdesk-rmm.workspace = true
+agentdesk-transport.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hostname.workspace = true
+gpui-kit = "0.11.0"
+image.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+tray-icon.workspace = true
+windows.workspace = true
+
+[build-dependencies]
+embed-resource = "3"
