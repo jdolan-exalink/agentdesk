@@ -449,7 +449,7 @@ async fn run_incoming_host_session(
     mut chat_rx: mpsc::UnboundedReceiver<String>,
 ) -> anyhow::Result<()> {
     let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
-    let _wallpaper_guard = WallpaperBlackoutGuard::activate();
+    let _wallpaper_guard = WallpaperBlackoutGuard::activate_in_background();
 
     let monitors = enumerate_monitors();
     let _ = tunnel

@@ -603,6 +603,13 @@ impl ViewerFrameCanvas {
         }
     }
 
+    /// Creates the H.264 decoder ahead of the first frame (MFT enumeration costs 100-500 ms).
+    pub fn prewarm_h264(&mut self) {
+        if self.h264.is_none() {
+            self.h264 = MfH264Decoder::try_new();
+        }
+    }
+
     pub fn apply_frame(
         &mut self,
         encoding: FrameEncoding,
@@ -781,6 +788,10 @@ pub fn spawn_capture_worker(
         let mut h264_hw_broken = false;
         let mut h264_empty_streak = 0u16;
         let mut h264_force_next = false;
+        let mut h264_pending: Option<((u32, u32), std::sync::mpsc::Receiver<Option<MfH264Encoder>>)> =
+            None;
+        // The tile encoder keeps its own reference frame; after H.264 frames it is stale.
+        let mut last_sent_h264 = false;
         let mut last_codec_label = String::new();
         let mut bgra_buf: Vec<u8> = Vec::new();
         let mut last_dims: Option<(u32, u32)> = None;
@@ -791,6 +802,11 @@ pub fn spawn_capture_worker(
         // times so H.264 sharpens text that was blurred while it was moving (scroll, drag).
         let mut refine_left = 0u8;
         let mut last_video_sent = Instant::now();
+        let worker_started = Instant::now();
+        // Set when an async (hardware) encoder accepted a frame but has not returned it yet.
+        // Its output must be collected even if the screen never changes again, otherwise a
+        // static remote desktop leaves the viewer without a first image forever.
+        let mut h264_awaiting: Option<Instant> = None;
 
         while !*stop_rx.borrow() {
             let desired_mon = monitor_idx.load(Ordering::Relaxed);
@@ -894,9 +910,56 @@ pub fn spawn_capture_worker(
                 Err(_) => None,
             };
 
+            if updated_dims.is_none() {
+                if let (Some(since), Some(enc)) = (h264_awaiting, h264_enc.as_mut()) {
+                    match enc.poll_output(Duration::from_millis(4)) {
+                        Ok(Some(annex_b)) => {
+                            h264_awaiting = None;
+                            h264_empty_streak = 0;
+                            let (tw, th) = enc.dimensions();
+                            seq += 1;
+                            let pkt = DataPacket::VideoFrame(VideoFrame {
+                                seq,
+                                timestamp_ms: unix_now_ms(),
+                                width: tw,
+                                height: th,
+                                encoding: FrameEncoding::H264AnnexB,
+                                payload: annex_b,
+                            });
+                            if pkt_tx.try_send(pkt).is_ok() {
+                                abr.lock().unwrap().on_frame_sent(seq);
+                                last_video_sent = Instant::now();
+                                last_sent_h264 = true;
+                            } else {
+                                h264_force_next = true;
+                            }
+                        }
+                        Ok(None) if since.elapsed() < Duration::from_millis(400) => {}
+                        _ => {
+                            // Encoder swallowed the frame: drop it, fall back (software MFT,
+                            // then tiles) and re-send the current screen right away.
+                            if enc.is_hardware {
+                                h264_hw_broken = true;
+                            } else {
+                                h264_disabled_until = Instant::now() + Duration::from_secs(45);
+                            }
+                            h264_enc = None;
+                            h264_awaiting = None;
+                            h264_force_next = true;
+                            encoder.force_keyframe();
+                        }
+                    }
+                }
+            }
+
             if let Some((src_w, src_h)) = updated_dims {
                 let pref = codec_pref.load(Ordering::Relaxed); // 0=Auto, 1=HardwareH264, 2=HybridTiles
-                let try_h264 = pref != 2 && (pref == 1 || Instant::now() >= h264_disabled_until);
+                // Safety net: if nothing reached the viewer 1.5 s into the session, send tiles.
+                let nothing_sent_yet =
+                    seq == 0 && worker_started.elapsed() > Duration::from_millis(1500);
+                let try_h264 = pref != 2
+                    && !nothing_sent_yet
+                    && (pref == 1 || Instant::now() >= h264_disabled_until);
                 let mut sent_h264 = false;
 
                 if try_h264 {
@@ -923,18 +986,41 @@ pub fn spawn_capture_worker(
                         None => true,
                     };
                     if need_recreate {
-                        h264_enc = MfH264Encoder::try_new_with(
-                            tw,
-                            th,
-                            60,
-                            bitrate,
-                            !h264_hw_broken,
-                            true,
-                        );
-                        h264_empty_streak = 0;
-                        h264_force_next = true;
-                        if h264_enc.is_none() {
-                            h264_disabled_until = Instant::now() + Duration::from_secs(60);
+                        // Creating an MFT (enumeration + NVENC/QSV/AMF activation) takes
+                        // 0.3-1.5 s. Do it on a helper thread and keep streaming tiles meanwhile,
+                        // so the viewer gets its first image right after the tunnel is up.
+                        let mut ready: Option<((u32, u32), Option<MfH264Encoder>)> = None;
+                        if let Some((dims, rx)) = &h264_pending {
+                            match rx.try_recv() {
+                                Ok(enc) => ready = Some((*dims, enc)),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    ready = Some((*dims, None))
+                                }
+                            }
+                        }
+                        match ready {
+                            Some((dims, enc)) => {
+                                h264_pending = None;
+                                h264_enc = if dims == (tw, th) { enc } else { None };
+                                h264_empty_streak = 0;
+                                h264_force_next = true;
+                                if h264_enc.is_none() && dims == (tw, th) {
+                                    h264_disabled_until = Instant::now() + Duration::from_secs(60);
+                                }
+                            }
+                            None if h264_pending.is_none() => {
+                                h264_enc = None;
+                                let (txe, rxe) = std::sync::mpsc::channel();
+                                let allow_hw = !h264_hw_broken;
+                                std::thread::spawn(move || {
+                                    let _ = txe.send(MfH264Encoder::try_new_with(
+                                        tw, th, 60, bitrate, allow_hw, true,
+                                    ));
+                                });
+                                h264_pending = Some(((tw, th), rxe));
+                            }
+                            None => {}
                         }
                     } else if let Some(enc) = h264_enc.as_mut() {
                         // Live bitrate change: no new encoder, no IDR, no resolution jump.
@@ -951,6 +1037,7 @@ pub fn spawn_capture_worker(
                             Ok(Some(annex_b)) => {
                                 h264_empty_streak = 0;
                                 h264_force_next = false;
+                                h264_awaiting = None;
                                 if last_codec_label != enc.codec_name {
                                     last_codec_label = enc.codec_name.clone();
                                     let _ = cursor_tx.try_send(DataPacket::Control(
@@ -972,6 +1059,7 @@ pub fn spawn_capture_worker(
                                 if pkt_tx.try_send(pkt).is_ok() {
                                     abr.lock().unwrap().on_frame_sent(seq);
                                     last_video_sent = Instant::now();
+                                    last_sent_h264 = true;
                                 } else {
                                     // Reference chain broken: recover with an IDR.
                                     h264_force_next = true;
@@ -983,7 +1071,11 @@ pub fn spawn_capture_worker(
                                 // only give up after ~1.5 s without a single output.
                                 h264_empty_streak = h264_empty_streak.saturating_add(1);
                                 sent_h264 = true;
-                                if h264_empty_streak >= 90 {
+                                h264_force_next = false;
+                                if h264_awaiting.is_none() {
+                                    h264_awaiting = Some(Instant::now());
+                                }
+                                if h264_empty_streak >= 30 {
                                     h264_failed = true;
                                 }
                             }
@@ -993,6 +1085,8 @@ pub fn spawn_capture_worker(
                     if h264_failed {
                         let was_hw = h264_enc.as_ref().map(|e| e.is_hardware).unwrap_or(false);
                         h264_enc = None;
+                        h264_awaiting = None;
+                        h264_force_next = true;
                         sent_h264 = false;
                         if was_hw && !h264_hw_broken {
                             // Retry right away with the software MFT before giving up on video.
@@ -1006,6 +1100,10 @@ pub fn spawn_capture_worker(
                 }
 
                 if !sent_h264 && !is_refine {
+                    if last_sent_h264 {
+                        encoder.force_keyframe();
+                        last_sent_h264 = false;
+                    }
                     if let Some((ew, eh, payload)) =
                         encoder.encode_bgra(src_w, src_h, &bgra_buf, max_width, jpeg_quality)
                     {

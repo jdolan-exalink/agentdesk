@@ -240,6 +240,10 @@ mod win_mf {
             allow_sw: bool,
         ) -> Option<Self> {
             ensure_mf();
+            // May run on a helper thread (async encoder creation): join the MTA there too.
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
             let w = width & !1;
             let h = height & !1;
             if w < 64 || h < 64 {
@@ -491,6 +495,17 @@ mod win_mf {
                     Ok(Some(encoded))
                 }
             }
+        }
+
+        /// Collects output an async encoder finished after `encode_bgra` returned (hardware
+        /// encoders often keep 1-2 frames in flight). No-op for synchronous MFTs.
+        pub fn poll_output(&mut self, max_wait: Duration) -> Result<Option<Vec<u8>>, String> {
+            if self.ev_gen.is_none() {
+                return Ok(None);
+            }
+            let mut out = Vec::new();
+            unsafe { self.pump_async_events(&mut out, max_wait, false, true)? };
+            Ok(if out.is_empty() { None } else { Some(out) })
         }
 
         /// Drains the async MFT event queue. Every METransformHaveOutput yields exactly one
@@ -840,6 +855,13 @@ mod win_mf {
 
         pub fn bitrate(&self) -> u32 {
             0
+        }
+
+        pub fn poll_output(
+            &mut self,
+            _max_wait: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
         }
 
         pub fn set_bitrate(&mut self, _bitrate_bps: u32) {}

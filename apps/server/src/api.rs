@@ -1955,15 +1955,17 @@ pub async fn connect_by_id(
     if !raw_pw.is_empty() {
         let access_hash: Option<String> = row.get("access_password_hash");
         let personal_hash: Option<String> = row.get("personal_password_hash");
-        let access_ok = access_hash
-            .as_deref()
-            .map(|h| verify_password(raw_pw, h).unwrap_or(false))
-            .unwrap_or(false);
-        let personal_ok = personal_hash
-            .as_deref()
-            .map(|h| verify_password(raw_pw, h).unwrap_or(false))
-            .unwrap_or(false);
-        authenticated = access_ok || personal_ok;
+        // Argon2 is deliberately slow: run it off the async workers and stop at the first match
+        // (it used to always hash twice on the request path).
+        let pw = raw_pw.to_string();
+        authenticated = tokio::task::spawn_blocking(move || {
+            [access_hash, personal_hash]
+                .iter()
+                .flatten()
+                .any(|h| verify_password(&pw, h).unwrap_or(false))
+        })
+        .await
+        .unwrap_or(false);
     } else if let Some(tok) = reconnect_tok {
         let thash = sha256_hex(tok.as_bytes());
         let valid: Option<Uuid> = sqlx::query_scalar(

@@ -13,8 +13,8 @@ use agentdesk_protocol::{
 };
 use agentdesk_transport::{
     bind_p2p_udp_socket, discover_udp_candidates, extract_stun_addr_from_ws_url,
-    send_adaptive_packet, spawn_p2p_punch, store_received_file_for_target, verify_sha256_hex,
-    P2pUdpChannel, RelayTunnel,
+    connect_ws, send_adaptive_packet, spawn_p2p_punch, store_received_file_for_target,
+    verify_sha256_hex, P2pUdpChannel, RelayTunnel,
 };
 use gpui_kit::base::StyledExt;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -97,6 +97,8 @@ enum TunnelEvent {
     VideoCodecActive(String, bool),
     Printers(Vec<PrinterInfo>),
     PrintResult(bool, String),
+    /// Connection progress while the status line still says "Negociando…".
+    Stage(String),
     Ended(String),
 }
 
@@ -110,6 +112,7 @@ enum SidePanel {
 }
 
 pub struct RemoteSession {
+    opened_at: Instant,
     session_id: Uuid,
     label: SharedString,
     allow_control: bool,
@@ -213,6 +216,9 @@ impl RemoteSession {
         let ack_tx_dec = out_tx.clone();
         std::thread::spawn(move || {
             let mut canvas = ViewerFrameCanvas::new();
+            // Create the H.264 decoder now, while the tunnel is still being set up, instead of
+            // on the first frame.
+            canvas.prewarm_h264();
             let mut bytes_in_window = 0usize;
             let mut bw_start = Instant::now();
             while let Ok(vf) = dec_rx.recv() {
@@ -258,14 +264,29 @@ impl RemoteSession {
             }
         });
 
+        let connect_started = Instant::now();
         runtime().spawn(async move {
-            let mut tunnel = match RelayTunnel::connect(&ws_url, true).await {
-                Ok(t) => t,
+            let stage = |txt: &str| {
+                let secs = connect_started.elapsed().as_secs_f32();
+                let _ = ev_tx.send(TunnelEvent::Stage(format!("Negociando · {txt} ({secs:.1} s)")));
+            };
+            stage("conectando al relay");
+            let ws = match connect_ws(&ws_url).await {
+                Ok((ws, _)) => ws,
                 Err(e) => {
-                    let _ = ev_tx.send(TunnelEvent::Ended(format!("Error E2EE/Relay: {e}")));
+                    let _ = ev_tx.send(TunnelEvent::Ended(format!("Error Relay: {e}")));
                     return;
                 }
             };
+            stage("esperando al equipo remoto");
+            let mut tunnel = match RelayTunnel::handshake_over_ws(ws, true).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = ev_tx.send(TunnelEvent::Ended(format!("Error E2EE: {e}")));
+                    return;
+                }
+            };
+            stage("túnel cifrado listo, esperando la primera imagen");
             let audio_player = AudioPlayer::new();
 
             let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
@@ -655,6 +676,7 @@ impl RemoteSession {
             file_path_input,
             file_status: String::new(),
             status_line: "Negociando túnel E2EE Noise_XX…".into(),
+            opened_at: Instant::now(),
             viewport_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle,
             last_mouse_norm: (0.0, 0.0),
@@ -738,6 +760,12 @@ impl RemoteSession {
                     self.print_status = format!("{prefix}{message}");
                     self.status_line = self.print_status.clone();
                 }
+                TunnelEvent::Stage(text) => {
+                    if self.status_line.starts_with("Negociando") {
+                        self.status_line = text;
+                        changed = true;
+                    }
+                }
                 TunnelEvent::Ended(reason) => {
                     self.status_line = format!("Sesión finalizada: {reason}");
                     if !self.manual_disconnect && !self.notified_end {
@@ -757,7 +785,10 @@ impl RemoteSession {
             self.frame_dims = (w, h);
             self.last_bgra_frame = Some((w, h, bgra.clone()));
             if self.status_line.starts_with("Negociando") {
-                self.status_line = "Sesión E2EE activa".into();
+                self.status_line = format!(
+                    "Sesión E2EE activa · primera imagen en {:.1} s",
+                    self.opened_at.elapsed().as_secs_f32()
+                );
             }
             if let Some(buf) = image::RgbaImage::from_raw(w, h, bgra) {
                 let next_img = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));

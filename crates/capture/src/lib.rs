@@ -1067,6 +1067,15 @@ pub mod win {
     }
 
     impl WallpaperBlackoutGuard {
+        /// Changes the wallpaper on a helper thread. `SPI_SETDESKWALLPAPER` + `SetSysColors`
+        /// broadcast WM_SETTINGCHANGE synchronously to every top-level window and can block for
+        /// seconds when any app is slow to answer; doing it inline stalled the session start
+        /// (the viewer sat on "Negociando túnel E2EE"). The original wallpaper is restored when
+        /// the returned handle is dropped.
+        pub fn activate_in_background() -> crate::BackgroundWallpaperGuard {
+            crate::BackgroundWallpaperGuard::start()
+        }
+
         pub fn activate() -> Self {
             unsafe {
                 let mut path_buf = vec![0u16; 520];
@@ -1197,6 +1206,9 @@ pub mod win {
         pub fn activate() -> Self {
             Self
         }
+        pub fn activate_in_background() -> crate::BackgroundWallpaperGuard {
+            crate::BackgroundWallpaperGuard::start()
+        }
     }
     impl ScreenCapturer for WindowsCapturer {
         fn capture_rgba(&mut self) -> Result<RawFrame, CaptureError> {
@@ -1217,6 +1229,25 @@ pub mod win {
     pub fn inject_input_event(_ev: &InputEvent) {}
     pub fn current_process_private_mb() -> f64 {
         0.0
+    }
+}
+
+/// Owns a helper thread that holds a [`WallpaperBlackoutGuard`]; dropping it restores the
+/// wallpaper on that same thread, so neither activation nor restore blocks the caller.
+pub struct BackgroundWallpaperGuard {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl BackgroundWallpaperGuard {
+    pub fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let guard = win::WallpaperBlackoutGuard::activate();
+            // Returns Err once the owner drops the sender.
+            let _ = rx.recv();
+            drop(guard);
+        });
+        Self { _release: tx }
     }
 }
 

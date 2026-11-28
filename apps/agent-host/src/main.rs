@@ -781,7 +781,7 @@ async fn run_host_session(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
-    let _wallpaper_guard = WallpaperBlackoutGuard::activate();
+    let _wallpaper_guard = WallpaperBlackoutGuard::activate_in_background();
     tracing::info!("Noise_XX E2EE session established with viewer");
 
     let monitors = enumerate_monitors();
