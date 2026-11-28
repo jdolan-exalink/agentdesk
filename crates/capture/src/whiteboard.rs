@@ -16,7 +16,7 @@ mod win_wb {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, ShowWindow,
+        GetSystemMetrics, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, ShowWindow,
         TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MSG, SM_CXSCREEN, SM_CYSCREEN,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
         ULW_ALPHA, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -241,7 +241,7 @@ mod win_wb {
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-            let _ = UpdateLayeredWindow(
+            let ulw_ok = UpdateLayeredWindow(
                 hwnd,
                 None,
                 Some(&dst_pt),
@@ -252,6 +252,13 @@ mod win_wb {
                 Some(&blend),
                 ULW_ALPHA,
             );
+            crate::hostdiag::log(&format!(
+                "whiteboard: {} strokes visible={} rect=({vx},{vy},{vw}x{vh}) update={:?} window_visible={}",
+                st.strokes.len(),
+                st.visible,
+                ulw_ok.map_err(|e| e.message()),
+                IsWindowVisible(hwnd).as_bool()
+            ));
             SelectObject(mem_dc, old);
             let _ = DeleteObject(dib);
             let _ = DeleteDC(mem_dc);

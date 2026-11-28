@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod h264;
+pub mod hostdiag;
 pub mod printing;
 pub mod stream;
 pub mod whiteboard;
@@ -266,6 +267,28 @@ pub mod win {
             }
         }
         out
+    }
+
+    /// Moves the calling thread to the input desktop only when it differs from the thread's
+    /// current one. The handle needs DESKTOP_JOURNALPLAYBACK (all desktop rights, 0x1FF):
+    /// with fewer rights SetThreadDesktop succeeds but every SendInput is silently dropped.
+    fn follow_input_desktop_for_injection() {
+        let env = crate::hostdiag::host_environment();
+        match env.input_desktop.as_deref() {
+            Some(name) if !name.eq_ignore_ascii_case(&env.thread_desktop) => unsafe {
+                if let Ok(hdesk) = OpenInputDesktop(Default::default(), false, DESKTOP_ACCESS_FLAGS(0x01FF)) {
+                    if SetThreadDesktop(hdesk).is_ok() {
+                        crate::hostdiag::log(&format!(
+                            "input thread moved from desktop {} to {name}",
+                            env.thread_desktop
+                        ));
+                    } else {
+                        let _ = CloseDesktop(hdesk);
+                    }
+                }
+            },
+            _ => {}
+        }
     }
 
     fn attach_input_desktop() {
@@ -882,6 +905,18 @@ pub mod win {
     }
 
     pub fn inject_input_event(ev: &InputEvent) {
+        // SendInput only reaches the desktop that currently receives input. The injecting
+        // thread (a tokio worker, no windows of its own) follows it, so input keeps working
+        // after a lock/unlock or UAC prompt switched desktops. Re-checked at most twice a second.
+        thread_local! {
+            static LAST_ATTACH: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+        }
+        LAST_ATTACH.with(|c| {
+            if c.get().is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500)) {
+                follow_input_desktop_for_injection();
+                c.set(Some(std::time::Instant::now()));
+            }
+        });
         unsafe {
             match ev {
                 InputEvent::UnicodeChar { ch } => {
@@ -1346,10 +1381,15 @@ pub mod win {
 
 /// Injects viewer input on the host and notices when Windows silently drops it (UIPI blocks
 /// injected input while an elevated window is in front, and the lock screen / UAC prompt runs
-/// on the secure desktop). Returns a one-off notice for the viewer when that happens.
+/// on the secure desktop). Everything is also logged to the host session log.
 pub struct RemoteInputInjector {
     misses: u32,
     last_notice: Option<std::time::Instant>,
+    env: hostdiag::HostEnvironment,
+    stats_since: std::time::Instant,
+    st_events: u64,
+    st_moves: u64,
+    st_moves_ok: u64,
 }
 
 impl Default for RemoteInputInjector {
@@ -1361,33 +1401,93 @@ impl Default for RemoteInputInjector {
 impl RemoteInputInjector {
     pub fn new() -> Self {
         win::set_input_target_monitor(0);
-        Self { misses: 0, last_notice: None }
+        let env = hostdiag::host_environment();
+        hostdiag::log(&format!(
+            "session start v{} | {} | target_rect={:?}",
+            env!("CARGO_PKG_VERSION"),
+            env.summary(),
+            win::monitor_desktop_rect(0)
+        ));
+        Self {
+            misses: 0,
+            last_notice: None,
+            env,
+            stats_since: std::time::Instant::now(),
+            st_events: 0,
+            st_moves: 0,
+            st_moves_ok: 0,
+        }
+    }
+
+    /// Problems detected at session start that will stop remote control, as one line for the
+    /// viewer (`None` when the host looks healthy).
+    pub fn startup_notice(&self) -> Option<String> {
+        let p = self.env.problems();
+        if p.is_empty() {
+            None
+        } else {
+            Some(format!("\u{26A0} Control remoto: {}.", p.join("; ")))
+        }
     }
 
     /// The viewer switched monitors: normalized coordinates now refer to `index`.
     pub fn set_monitor(&self, index: usize) {
         win::set_input_target_monitor(index);
+        hostdiag::log(&format!(
+            "select monitor {index} -> rect {:?}",
+            win::monitor_desktop_rect(index)
+        ));
+    }
+
+    fn flush_stats(&mut self) {
+        if self.stats_since.elapsed() < std::time::Duration::from_secs(5) || self.st_events == 0 {
+            return;
+        }
+        let env = hostdiag::host_environment();
+        hostdiag::log(&format!(
+            "input: {} events, {} moves, {} landed | {}",
+            self.st_events,
+            self.st_moves,
+            self.st_moves_ok,
+            env.summary()
+        ));
+        self.st_events = 0;
+        self.st_moves = 0;
+        self.st_moves_ok = 0;
+        self.stats_since = std::time::Instant::now();
     }
 
     pub fn inject(&mut self, ev: &agentdesk_protocol::InputEvent) -> Option<String> {
-        let target = win::inject_input_event_checked(ev)?;
+        self.st_events += 1;
+        let Some(target) = win::inject_input_event_checked(ev) else {
+            self.flush_stats();
+            return None;
+        };
+        self.st_moves += 1;
         if win::cursor_is_at(target) {
+            self.st_moves_ok += 1;
             self.misses = 0;
+            self.flush_stats();
             return None;
         }
         self.misses += 1;
+        self.flush_stats();
         let recently = self
             .last_notice
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30));
         if self.misses >= 4 && !recently {
             self.last_notice = Some(std::time::Instant::now());
             self.misses = 0;
-            return Some(
-                "\u{26A0} Windows está bloqueando el mouse y el teclado remotos: hay una ventana \
-                 de administrador en primer plano, un aviso de UAC o la pantalla bloqueada. \
+            let env = hostdiag::host_environment();
+            hostdiag::log(&format!("input dropped by Windows at {target:?} | {}", env.summary()));
+            let mut extra = env.problems().join("; ");
+            if extra.is_empty() {
+                extra = "probablemente una ventana de administrador en primer plano".into();
+            }
+            return Some(format!(
+                "\u{26A0} Windows está bloqueando el mouse y el teclado remotos ({extra}). \
                  Cerrala desde el equipo o ejecutá AgentDesk como administrador allí."
-                    .into(),
-            );
+            ));
         }
         None
     }

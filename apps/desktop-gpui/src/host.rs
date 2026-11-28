@@ -493,6 +493,11 @@ async fn run_incoming_host_session(
 
     let whiteboard = WhiteboardOverlay::new();
     let mut injector = agentdesk_capture::RemoteInputInjector::new();
+    if let Some(text) = injector.startup_notice() {
+        let _ = tunnel
+            .send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text }))
+            .await;
+    }
     // The hardware snapshot shells out to PowerShell/WMI (seconds, far longer on domain-joined
     // servers). It must never run inside the session loop: while it ran, video, input and the
     // whiteboard all stopped, and the viewer polls it every 10 s.

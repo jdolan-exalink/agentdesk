@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 agentdesk-protocol.workspace = true
+chrono.workspace = true
 image.workspace = true
 jpeg-encoder.workspace = true
 lz4_flex.workspace = true
