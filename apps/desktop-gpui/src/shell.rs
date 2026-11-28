@@ -327,6 +327,7 @@ impl Client {
         let has_unread = !self.device_alerts.is_empty()
             || self.tickets.iter().any(|t| t.status != "resolved" && t.status != "closed");
         let tabs = self.render_page_tabs(cx);
+        let update_badge = self.render_update_badge(cx);
 
         div()
             .flex()
@@ -386,6 +387,7 @@ impl Client {
             )
             .child(div().flex_1())
             .when_some(tabs, |d, t| d.child(t))
+            .when_some(update_badge, |d, b| d.child(b))
             .child(
                 icon_btn("topbar-bell", IconName::Bell, "Notificaciones", show_notif, p)
                     .relative()

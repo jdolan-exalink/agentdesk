@@ -29,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/ready", get(api::health_ready))
         .route("/api/v1/downloads", get(api::list_downloads))
         .route("/downloads/file/{filename}", get(api::download_artifact_file))
+        .route("/api/v1/updates/{product}", get(api::update_manifest))
         // Setup & Auth
         .route("/api/v1/setup/status", get(auth::setup_status))
         .route("/api/v1/setup/bootstrap", post(auth::bootstrap))

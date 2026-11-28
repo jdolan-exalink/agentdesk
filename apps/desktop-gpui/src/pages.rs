@@ -3516,7 +3516,11 @@ impl Client {
         let right_content = match sec {
             "users" => self.render_users_mfa(cx),
             "ai" => self.render_ai_settings_full(cx),
-            "about" => workspace_panel("Acerca de", p)
+            "about" => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(workspace_panel("Acerca de", p)
                 .child(row_item(
                     IconName::Info,
                     "Versión",
@@ -3539,7 +3543,8 @@ impl Client {
                     "ID de este equipo",
                     "Identificador para recibir soporte.",
                     div().child(div().text_sm().font_semibold().child(self.local_connection_id.clone())),
-                )),
+                )))
+                .child(self.render_update_panel(cx)),
             "auth" => {
                 let mut mfa_panel = workspace_panel("Autenticación y MFA TOTP", p)
                     .child(

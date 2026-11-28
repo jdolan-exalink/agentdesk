@@ -7,6 +7,7 @@ mod session_panel;
 mod shell;
 mod theme;
 mod ui;
+mod updater;
 mod viewer;
 
 use agentdesk_protocol::{
@@ -554,6 +555,8 @@ pub struct Client {
     pub connect_mode: u8,
     /// Panel que abrirá el próximo visor (p. ej. "files" en modo archivos).
     pub pending_viewer_panel: Option<&'static str>,
+    /// Actualizador del cliente (manifiesto firmado + consentimiento).
+    pub updater: updater::Updater,
 }
 
 impl Client {
@@ -742,6 +745,7 @@ impl Client {
             monitor_tab: "metrics",
             connect_mode: 0,
             pending_viewer_panel: None,
+            updater: updater::Updater::default(),
         };
 
         window.focus(&client.focus_handle, cx);
@@ -756,6 +760,7 @@ impl Client {
         .detach();
 
         client.check_server(cx);
+        client.schedule_update_checks(cx);
         client.restart_host(cx);
 
         for inp in [&client.login_email, &client.login_password, &client.login_mfa] {
@@ -6207,6 +6212,7 @@ fn restore_window_bounds(
 
 fn main() {
     startup_log("process started");
+    updater::after_update_startup();
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         startup_log(&format!("panic: {info}"));
