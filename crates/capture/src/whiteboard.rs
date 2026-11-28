@@ -3,7 +3,7 @@ use agentdesk_protocol::WhiteboardStroke;
 #[cfg(windows)]
 mod win_wb {
     use super::*;
-    use crate::win::enumerate_monitors;
+    use crate::win::monitor_desktop_rect;
     use agentdesk_protocol::WhiteboardTool;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
@@ -16,10 +16,10 @@ mod win_wb {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow,
+        GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, ShowWindow,
         TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MSG, SM_CXSCREEN, SM_CYSCREEN,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE,
-        ULW_ALPHA, WM_APP, WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        ULW_ALPHA, WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
@@ -258,12 +258,11 @@ mod win_wb {
         }
     }
 
+    /// Real desktop rectangle of the captured monitor (origin included), so the strokes land on
+    /// the screen the viewer is looking at even when it is not the primary one.
     fn monitor_rect(index: usize) -> (i32, i32, i32, i32) {
-        let mons = enumerate_monitors();
-        if mons.len() > 1 {
-            if let Some(m) = mons.get(index) {
-                return (0, 0, m.width.max(640) as i32, m.height.max(480) as i32);
-            }
+        if let Some(r) = monitor_desktop_rect(index) {
+            return r;
         }
         unsafe {
             let w = GetSystemMetrics(SM_CXSCREEN).max(640);
@@ -319,9 +318,25 @@ mod win_wb {
                     bounds: (vx, vy, vw, vh),
                 };
 
+                // Other always-on-top windows (support tools, kiosk apps) can cover the overlay
+                // after it was shown; re-assert the top of the z-order once a second.
+                let _ = SetTimer(hwnd, 1, 1000, None);
+
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    if msg.message == WM_WB_SYNC {
+                    if msg.message == WM_TIMER {
+                        if state.visible || !state.strokes.is_empty() {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                HWND_TOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                            );
+                        }
+                    } else if msg.message == WM_WB_SYNC {
                         let mut dirty = false;
                         while let Ok(cmd) = rx.try_recv() {
                             match cmd {

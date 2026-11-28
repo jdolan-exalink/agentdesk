@@ -1,5 +1,5 @@
 ﻿use agentdesk_capture::win::{
-    clipboard_sequence_number, current_process_private_mb, enumerate_monitors, inject_input_event,
+    clipboard_sequence_number, current_process_private_mb, enumerate_monitors,
     inject_special_combo, read_clipboard_files, read_clipboard_text, write_clipboard_files,
     write_clipboard_text, WallpaperBlackoutGuard, WindowsCapturer,
 };
@@ -492,6 +492,12 @@ async fn run_incoming_host_session(
     spawn_audio_capture_worker(stop_rx.clone(), audio_enabled.clone(), audio_tx);
 
     let whiteboard = WhiteboardOverlay::new();
+    let mut injector = agentdesk_capture::RemoteInputInjector::new();
+    // The hardware snapshot shells out to PowerShell/WMI (seconds, far longer on domain-joined
+    // servers). It must never run inside the session loop: while it ran, video, input and the
+    // whiteboard all stopped, and the viewer polls it every 10 s.
+    let (hw_tx, mut hw_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let hw_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut pending_print_jobs: std::collections::VecDeque<(Uuid, Option<String>)> =
         std::collections::VecDeque::new();
     let mut uploads: HashMap<Uuid, PendingHostUpload> = HashMap::new();
@@ -582,7 +588,9 @@ async fn run_incoming_host_session(
                         match pkt {
                             DataPacket::Input(ev) => {
                                 if allow_control {
-                                    inject_input_event(&ev);
+                                    if let Some(text) = injector.inject(&ev) {
+                                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                                    }
                                 }
                             }
                             DataPacket::Control(ControlMessage::Ping { ts_ms }) => {
@@ -615,11 +623,16 @@ async fn run_incoming_host_session(
                     break;
                 }
             }
+            Some(resources_json) = hw_rx.recv() => {
+                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot { resources_json })).await;
+            }
             incoming = tunnel.recv_packet() => {
                 match incoming {
                     Ok(DataPacket::Input(ev)) => {
                         if allow_control {
-                            inject_input_event(&ev);
+                            if let Some(text) = injector.inject(&ev) {
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                            }
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::Ping { ts_ms })) => {
@@ -648,6 +661,7 @@ async fn run_incoming_host_session(
                     Ok(DataPacket::Control(ControlMessage::SelectMonitor { index })) => {
                         monitor_idx.store(index, std::sync::atomic::Ordering::Relaxed);
                         whiteboard.set_monitor(index);
+                        injector.set_monitor(index);
                     }
                     Ok(DataPacket::Control(ControlMessage::AudioControl { enabled })) => {
                         audio_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -704,12 +718,14 @@ async fn run_incoming_host_session(
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::RequestHardwareResources)) => {
-                        let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                            .await
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                            resources_json: hw.to_string(),
-                        })).await;
+                        if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                            tokio::task::spawn_blocking(move || {
+                                let hw = agentdesk_rmm::collect_hardware_resources();
+                                busy.store(false, std::sync::atomic::Ordering::Release);
+                                let _ = hw_done_tx.send(hw.to_string());
+                            });
+                        }
                     }
                     Ok(DataPacket::Control(ControlMessage::SessionAction { action, target_user, delay_secs })) => {
                         if allow_control {
@@ -730,12 +746,14 @@ async fn run_incoming_host_session(
                                     let _ = tokio::task::spawn_blocking(move || agentdesk_rmm::sign_out_windows_user(sid.as_deref())).await;
                                 }
                                 "list_users" => {
-                                    let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                                        .await
-                                        .unwrap_or_else(|_| serde_json::json!({}));
-                                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                                        resources_json: hw.to_string(),
-                                    })).await;
+                                    if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                        let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                                        tokio::task::spawn_blocking(move || {
+                                            let hw = agentdesk_rmm::collect_hardware_resources();
+                                            busy.store(false, std::sync::atomic::Ordering::Release);
+                                            let _ = hw_done_tx.send(hw.to_string());
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }

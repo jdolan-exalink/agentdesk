@@ -187,9 +187,10 @@ pub mod win {
     };
     use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorInfo, GetSystemMetrics, LoadCursorW, SystemParametersInfoW, CURSORINFO,
+        GetCursorInfo, GetCursorPos, GetSystemMetrics, LoadCursorW, SystemParametersInfoW, CURSORINFO,
         CURSOR_SHOWING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
-        IDC_SIZEWE, IDC_WAIT, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE, SPI_GETDESKWALLPAPER,
+        IDC_SIZEWE, IDC_WAIT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPIF_SENDCHANGE, SPI_GETDESKWALLPAPER,
         SPI_SETDESKWALLPAPER,
     };
 
@@ -789,6 +790,97 @@ pub mod win {
         }
     }
 
+    /// Desktop rectangle `(left, top, width, height)` of the DXGI output `index`, in the same
+    /// order and coordinate space the capturer uses (`EnumOutputs` on the default adapter).
+    pub fn monitor_desktop_rect(index: usize) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut device: Option<ID3D11Device> = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .ok()?;
+            let adapter = device?.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()?;
+            // Same fallback as the capturer: an out-of-range index captures output 0.
+            let output = adapter
+                .EnumOutputs(index as u32)
+                .or_else(|_| adapter.EnumOutputs(0))
+                .ok()?;
+            let r = output.GetDesc().ok()?.DesktopCoordinates;
+            Some((r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)))
+        }
+    }
+
+    /// Monitor rectangle that normalized mouse coordinates from the viewer refer to.
+    static INPUT_TARGET: std::sync::Mutex<Option<(i32, i32, i32, i32)>> =
+        std::sync::Mutex::new(None);
+
+    /// Points remote mouse input at the monitor the viewer is looking at. The viewer sends
+    /// coordinates normalized to the captured monitor, not to the whole virtual desktop.
+    pub fn set_input_target_monitor(index: usize) {
+        let rect = monitor_desktop_rect(index);
+        if let Ok(mut t) = INPUT_TARGET.lock() {
+            *t = rect;
+        }
+    }
+
+    fn input_target_rect() -> (i32, i32, i32, i32) {
+        if let Ok(mut t) = INPUT_TARGET.lock() {
+            if t.is_none() {
+                *t = monitor_desktop_rect(0);
+            }
+            if let Some(r) = *t {
+                return r;
+            }
+        }
+        unsafe {
+            (
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN).max(1),
+                GetSystemMetrics(SM_CYSCREEN).max(1),
+            )
+        }
+    }
+
+    /// Maps a viewer-normalized point to absolute screen pixels on the target monitor.
+    fn norm_to_screen(x: f32, y: f32) -> (i32, i32) {
+        let (left, top, w, h) = input_target_rect();
+        let px = left + (x.clamp(0.0, 1.0) * (w - 1) as f32).round() as i32;
+        let py = top + (y.clamp(0.0, 1.0) * (h - 1) as f32).round() as i32;
+        (px, py)
+    }
+
+    /// True when the OS cursor sits on `target` (a few px of tolerance). Used after injecting a
+    /// move to detect that Windows dropped it (UIPI: an elevated window is in front, or the
+    /// secure desktop / lock screen is active).
+    pub fn cursor_is_at(target: (i32, i32)) -> bool {
+        unsafe {
+            let mut p = windows::Win32::Foundation::POINT::default();
+            if GetCursorPos(&mut p).is_err() {
+                return true;
+            }
+            (p.x - target.0).abs() <= 3 && (p.y - target.1).abs() <= 3
+        }
+    }
+
+    /// Injects a viewer event. For mouse moves returns `Some(screen_px)` with the target point
+    /// so the caller can verify it with [`cursor_is_at`]; `None` for everything else.
+    pub fn inject_input_event_checked(ev: &InputEvent) -> Option<(i32, i32)> {
+        inject_input_event(ev);
+        match ev {
+            InputEvent::MouseMoveNorm { x, y } => Some(norm_to_screen(*x, *y)),
+            _ => None,
+        }
+    }
+
     pub fn inject_input_event(ev: &InputEvent) {
         unsafe {
             match ev {
@@ -827,8 +919,18 @@ pub mod win {
             }
             let input = match ev {
                 InputEvent::MouseMoveNorm { x, y } => {
-                    let nx = (x.clamp(0.0, 1.0) * 65535.0) as i32;
-                    let ny = (y.clamp(0.0, 1.0) * 65535.0) as i32;
+                    // MOUSEEVENTF_VIRTUALDESK spans every monitor: convert the monitor-relative
+                    // point to virtual-desktop units, or a multi-monitor host gets the click
+                    // somewhere else than where the viewer pointed.
+                    let (px, py) = norm_to_screen(*x, *y);
+                    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2);
+                    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2);
+                    let nx = (((px - vx) as i64 * 65535 + (vw as i64 - 1) / 2) / (vw as i64 - 1))
+                        .clamp(0, 65535) as i32;
+                    let ny = (((py - vy) as i64 * 65535 + (vh as i64 - 1) / 2) / (vh as i64 - 1))
+                        .clamp(0, 65535) as i32;
                     INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
@@ -1227,8 +1329,67 @@ pub mod win {
         }
     }
     pub fn inject_input_event(_ev: &InputEvent) {}
+    pub fn inject_input_event_checked(_ev: &InputEvent) -> Option<(i32, i32)> {
+        None
+    }
+    pub fn cursor_is_at(_target: (i32, i32)) -> bool {
+        true
+    }
+    pub fn set_input_target_monitor(_index: usize) {}
+    pub fn monitor_desktop_rect(_index: usize) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
     pub fn current_process_private_mb() -> f64 {
         0.0
+    }
+}
+
+/// Injects viewer input on the host and notices when Windows silently drops it (UIPI blocks
+/// injected input while an elevated window is in front, and the lock screen / UAC prompt runs
+/// on the secure desktop). Returns a one-off notice for the viewer when that happens.
+pub struct RemoteInputInjector {
+    misses: u32,
+    last_notice: Option<std::time::Instant>,
+}
+
+impl Default for RemoteInputInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RemoteInputInjector {
+    pub fn new() -> Self {
+        win::set_input_target_monitor(0);
+        Self { misses: 0, last_notice: None }
+    }
+
+    /// The viewer switched monitors: normalized coordinates now refer to `index`.
+    pub fn set_monitor(&self, index: usize) {
+        win::set_input_target_monitor(index);
+    }
+
+    pub fn inject(&mut self, ev: &agentdesk_protocol::InputEvent) -> Option<String> {
+        let target = win::inject_input_event_checked(ev)?;
+        if win::cursor_is_at(target) {
+            self.misses = 0;
+            return None;
+        }
+        self.misses += 1;
+        let recently = self
+            .last_notice
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30));
+        if self.misses >= 4 && !recently {
+            self.last_notice = Some(std::time::Instant::now());
+            self.misses = 0;
+            return Some(
+                "\u{26A0} Windows está bloqueando el mouse y el teclado remotos: hay una ventana \
+                 de administrador en primer plano, un aviso de UAC o la pantalla bloqueada. \
+                 Cerrala desde el equipo o ejecutá AgentDesk como administrador allí."
+                    .into(),
+            );
+        }
+        None
     }
 }
 

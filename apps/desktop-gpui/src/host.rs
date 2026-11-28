@@ -1,5 +1,5 @@
 use agentdesk_capture::win::{
-    clipboard_sequence_number, current_process_private_mb, enumerate_monitors, inject_input_event,
+    clipboard_sequence_number, current_process_private_mb, enumerate_monitors,
     inject_special_combo, read_clipboard_files, read_clipboard_text, write_clipboard_files,
     write_clipboard_text, WallpaperBlackoutGuard, WindowsCapturer,
 };
@@ -492,6 +492,12 @@ async fn run_incoming_host_session(
     spawn_audio_capture_worker(stop_rx.clone(), audio_enabled.clone(), audio_tx);
 
     let whiteboard = WhiteboardOverlay::new();
+    let mut injector = agentdesk_capture::RemoteInputInjector::new();
+    // The hardware snapshot shells out to PowerShell/WMI (seconds, far longer on domain-joined
+    // servers). It must never run inside the session loop: while it ran, video, input and the
+    // whiteboard all stopped, and the viewer polls it every 10 s.
+    let (hw_tx, mut hw_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let hw_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut pending_print_jobs: std::collections::VecDeque<(Uuid, Option<String>)> =
         std::collections::VecDeque::new();
     let mut uploads: HashMap<Uuid, PendingHostUpload> = HashMap::new();
@@ -582,7 +588,9 @@ async fn run_incoming_host_session(
                         match pkt {
                             DataPacket::Input(ev) => {
                                 if allow_control {
-                                    inject_input_event(&ev);
+                                    if let Some(text) = injector.inject(&ev) {
+                                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                                    }
                                 }
                             }
                             DataPacket::Control(ControlMessage::Ping { ts_ms }) => {
@@ -615,11 +623,16 @@ async fn run_incoming_host_session(
                     break;
                 }
             }
+            Some(resources_json) = hw_rx.recv() => {
+                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot { resources_json })).await;
+            }
             incoming = tunnel.recv_packet() => {
                 match incoming {
                     Ok(DataPacket::Input(ev)) => {
                         if allow_control {
-                            inject_input_event(&ev);
+                            if let Some(text) = injector.inject(&ev) {
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                            }
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::Ping { ts_ms })) => {
@@ -648,6 +661,7 @@ async fn run_incoming_host_session(
                     Ok(DataPacket::Control(ControlMessage::SelectMonitor { index })) => {
                         monitor_idx.store(index, std::sync::atomic::Ordering::Relaxed);
                         whiteboard.set_monitor(index);
+                        injector.set_monitor(index);
                     }
                     Ok(DataPacket::Control(ControlMessage::AudioControl { enabled })) => {
                         audio_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -704,12 +718,14 @@ async fn run_incoming_host_session(
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::RequestHardwareResources)) => {
-                        let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                            .await
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                            resources_json: hw.to_string(),
-                        })).await;
+                        if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                            tokio::task::spawn_blocking(move || {
+                                let hw = agentdesk_rmm::collect_hardware_resources();
+                                busy.store(false, std::sync::atomic::Ordering::Release);
+                                let _ = hw_done_tx.send(hw.to_string());
+                            });
+                        }
                     }
                     Ok(DataPacket::Control(ControlMessage::SessionAction { action, target_user, delay_secs })) => {
                         if allow_control {
@@ -730,12 +746,14 @@ async fn run_incoming_host_session(
                                     let _ = tokio::task::spawn_blocking(move || agentdesk_rmm::sign_out_windows_user(sid.as_deref())).await;
                                 }
                                 "list_users" => {
-                                    let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                                        .await
-                                        .unwrap_or_else(|_| serde_json::json!({}));
-                                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                                        resources_json: hw.to_string(),
-                                    })).await;
+                                    if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                        let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                                        tokio::task::spawn_blocking(move || {
+                                            let hw = agentdesk_rmm::collect_hardware_resources();
+                                            busy.store(false, std::sync::atomic::Ordering::Release);
+                                            let _ = hw_done_tx.send(hw.to_string());
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -848,4 +866,139 @@ async fn run_incoming_host_session(
 
     let _ = tunnel.close().await;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod session_e2e_probe {
+    //! Manual end-to-end probe (moves the real mouse and shows the whiteboard overlay):
+    //! `cargo test -p agentdesk-desktop-gpui session_e2e -- --ignored --nocapture`
+    use super::*;
+    use std::time::Instant;
+    use tokio::net::TcpListener;
+
+    fn cursor_pos() -> (i32, i32) {
+        let mut p = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
+        }
+        (p.x, p.y)
+    }
+
+    /// Pairs the first two websocket clients; host->viewer is throttled to `kbps` to mimic a WAN relay.
+    async fn fake_relay(listener: TcpListener, kbps: u64) {
+        let (a, _) = listener.accept().await.unwrap();
+        let host_ws = tokio_tungstenite::accept_async(a).await.unwrap();
+        let (b, _) = listener.accept().await.unwrap();
+        let viewer_ws = tokio_tungstenite::accept_async(b).await.unwrap();
+        let (mut h_tx, mut h_rx) = host_ws.split();
+        let (mut v_tx, mut v_rx) = viewer_ws.split();
+        tokio::spawn(async move {
+            while let Some(Ok(m)) = h_rx.next().await {
+                let n = m.len() as u64;
+                if kbps > 0 {
+                    tokio::time::sleep(Duration::from_micros(n * 8 * 1000 / kbps)).await;
+                }
+                if v_tx.send(m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        while let Some(Ok(m)) = v_rx.next().await {
+            if h_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn session_e2e_input_and_whiteboard() {
+        let kbps: u64 = std::env::var("PROBE_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
+        runtime().block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            tokio::spawn(fake_relay(listener, kbps));
+
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let (_chat_tx, chat_rx) = mpsc::unbounded_channel::<String>();
+            let (ev_tx, _ev_rx) = std::sync::mpsc::channel::<HostEvent>();
+            let host_url = url.clone();
+            let host = tokio::spawn(async move {
+                run_incoming_host_session(host_url, true, "probe".into(), ev_tx, stop_rx, chat_rx).await
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let (ws, _) = connect_ws(&url).await.unwrap();
+            let mut tunnel = RelayTunnel::handshake_over_ws(ws, true).await.unwrap();
+
+            let start = Instant::now();
+            let mut frames = 0u32;
+            let mut sent_wb = false;
+            let targets = [(0.30f32, 0.30f32), (0.70, 0.40), (0.40, 0.70)];
+            let mut ti = 0usize;
+            let mut sent_at: Option<Instant> = None;
+            let mut base = cursor_pos();
+            let mut lat = Vec::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(30));
+            while start.elapsed() < Duration::from_secs(14) && ti < targets.len() {
+                tokio::select! {
+                    pkt = tunnel.recv_packet() => {
+                        match pkt {
+                            Ok(DataPacket::VideoFrame(vf)) => {
+                                frames += 1;
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::FrameAck { seq: vf.seq, decode_ms: 2 })).await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => panic!("tunnel closed: {e}"),
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if start.elapsed() < Duration::from_secs(2) {
+                            continue; // let video ramp up first
+                        }
+                        if !sent_wb {
+                            sent_wb = true;
+                            tunnel.send_packet(&DataPacket::Control(ControlMessage::WhiteboardToggle { active: true })).await.unwrap();
+                            tunnel.send_packet(&DataPacket::Control(ControlMessage::WhiteboardStroke(agentdesk_protocol::WhiteboardStroke {
+                                id: 1, tool: agentdesk_protocol::WhiteboardTool::Pen, color_rgba: 0x00FF00FF, thickness: 10.0,
+                                points: vec![(0.2, 0.8), (0.5, 0.2), (0.8, 0.8)],
+                            }))).await.unwrap();
+                        }
+                        let (tx, ty) = targets[ti];
+                        match sent_at {
+                            None => {
+                                // The real viewer polls this every 10 s; it used to freeze the
+                                // host loop for the seconds the PowerShell/WMI snapshot takes.
+                                tunnel.send_packet(&DataPacket::Control(ControlMessage::RequestHardwareResources)).await.unwrap();
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                base = cursor_pos();
+                                tunnel.send_packet(&DataPacket::Input(agentdesk_protocol::InputEvent::MouseMoveNorm { x: tx, y: ty })).await.unwrap();
+                                sent_at = Some(Instant::now());
+                            }
+                            Some(t0) => {
+                                if cursor_pos() != base {
+                                    let (l, t, w, h) = agentdesk_capture::win::monitor_desktop_rect(0).unwrap();
+                                    let want = (l + (tx * (w - 1) as f32).round() as i32, t + (ty * (h - 1) as f32).round() as i32);
+                                    let got = cursor_pos();
+                                    assert!((got.0 - want.0).abs() <= 3 && (got.1 - want.1).abs() <= 3,
+                                        "cursor landed at {got:?}, expected {want:?} on monitor 0 ({l},{t},{w}x{h})");
+                                    lat.push(t0.elapsed());
+                                    ti += 1;
+                                    sent_at = None;
+                                    tokio::time::sleep(Duration::from_millis(400)).await;
+                                } else if t0.elapsed() > Duration::from_secs(4) {
+                                    lat.push(t0.elapsed());
+                                    ti += 1;
+                                    sent_at = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!("relay {kbps} kbps | frames received: {frames} | input latencies: {lat:?}");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = stop_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), host).await;
+        });
+    }
 }

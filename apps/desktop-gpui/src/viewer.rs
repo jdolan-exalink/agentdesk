@@ -781,6 +781,12 @@ impl RemoteSession {
                     self.rtt_ms = ms;
                 }
                 TunnelEvent::Chat(sender, text) => {
+                    // Host-side notices (e.g. Windows blocking injected input) come as chat from
+                    // "AgentDesk": surface them as a toast too, the chat panel is usually closed.
+                    if sender == "AgentDesk" {
+                        self.status_line = text.clone();
+                        self.ui.last_activity = Instant::now();
+                    }
                     self.chat_log.push(format!("{sender}: {text}"));
                 }
                 TunnelEvent::Monitors { monitors, active_index } => {
@@ -1894,9 +1900,10 @@ impl RemoteSession {
                 .border_color(rgb(if active { 0xFFFFFF } else { p.border }))
                 .bg(rgba(col))
         };
+        // Bottom-center: the session toolbar owns the top edge and was painting over this.
         div()
             .absolute()
-            .top_3()
+            .bottom(px(18.))
             .left_0()
             .right_0()
             .flex()
