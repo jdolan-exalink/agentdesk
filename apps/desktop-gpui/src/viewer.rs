@@ -182,6 +182,8 @@ pub struct RemoteSession {
     focus_handle: FocusHandle,
     last_mouse_norm: (f32, f32),
     manual_disconnect: bool,
+    /// Terminate already sent to host + server (idempotent session teardown).
+    terminate_sent: bool,
     notified_end: bool,
     /// Estado de la barra flotante (solo presentación).
     ui: ToolbarUi,
@@ -435,13 +437,17 @@ impl RemoteSession {
                             }
                         }
                     }
-                    Some((sock, eps)) = async {
+                    p2p_res = async {
                         match p2p_ep_rx.as_mut() {
-                            Some(rx) => rx.await.ok(),
+                            Some(rx) => rx.await,
                             None => std::future::pending().await,
                         }
                     } => {
                         p2p_ep_rx = None;
+                        // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                        // receiver in place, the next loop polled it again and tokio panicked ("called
+                        // after complete"), killing the whole session task: frozen image, no input.
+                        let Ok((sock, eps)) = p2p_res else { continue };
                         p2p_sock = Some(sock);
                         let _ = tunnel
                             .send_packet(&DataPacket::Control(ControlMessage::P2pOffer {
@@ -451,13 +457,17 @@ impl RemoteSession {
                             }))
                             .await;
                     }
-                    Some(ch) = async {
+                    p2p_res = async {
                         match p2p_ch_rx.as_mut() {
-                            Some(rx) => rx.await.ok(),
+                            Some(rx) => rx.await,
                             None => std::future::pending().await,
                         }
                     } => {
                         p2p_ch_rx = None;
+                        // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                        // receiver in place, the next loop polled it again and tokio panicked ("called
+                        // after complete"), killing the whole session task: frozen image, no input.
+                        let Ok(ch) = p2p_res else { continue };
                         let peer_label = format!("⚡ P2P Directo ({})", ch.peer_addr().ip());
                         udp_ch = Some(ch);
                         tel_transport.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -751,6 +761,7 @@ impl RemoteSession {
             focus_handle,
             last_mouse_norm: (0.0, 0.0),
             manual_disconnect: false,
+            terminate_sent: false,
             notified_end: false,
             ui: ToolbarUi::new(launch.allow_control),
         }
@@ -883,16 +894,25 @@ impl RemoteSession {
         let _ = self.out_tx.send(DataPacket::Control(msg));
     }
 
-    fn terminate_and_close(&mut self, reboot_arm: bool, window: &mut Window) {
+    /// Ends the session exactly once, whatever closed it (hang-up button, the window's X, or
+    /// the view being dropped): tells the host and the server, and tells the main window so its
+    /// "sesiones abiertas" count goes down. Before this, closing the window left the tunnel
+    /// streaming and the session listed as connected.
+    pub fn finish_session(&mut self, reboot_arm: bool) {
         self.manual_disconnect = true;
-        if reboot_arm && !self.notified_end {
+        if !self.notified_end {
             self.notified_end = true;
             let _ = self.on_ended.send(ViewerEndedNotice {
-                reason: "Reinicio solicitado".into(),
-                reboot_pending: true,
-                target: self.target.clone(),
+                reason: if reboot_arm { "Reinicio solicitado".into() } else { "Cerrada por el usuario".into() },
+                reboot_pending: reboot_arm,
+                // No reconnect prompt for a session the user closed on purpose.
+                target: if reboot_arm { self.target.clone() } else { None },
             });
         }
+        if self.terminate_sent {
+            return;
+        }
+        self.terminate_sent = true;
         self.send_control(ControlMessage::Terminate {
             reason: if reboot_arm {
                 "reboot requested".into()
@@ -907,9 +927,18 @@ impl RemoteSession {
                 self.session_id
             );
             runtime().spawn(async move {
-                let _ = reqwest::Client::new().post(url).bearer_auth(tok).send().await;
+                let _ = reqwest::Client::new()
+                    .post(url)
+                    .bearer_auth(tok)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await;
             });
         }
+    }
+
+    fn terminate_and_close(&mut self, reboot_arm: bool, window: &mut Window) {
+        self.finish_session(reboot_arm);
         window.remove_window();
     }
 
@@ -2875,5 +2904,11 @@ impl RemoteSession {
                 .child(Icon::new(icon).size(px(16.)).text_color(rgb(p.accent)))
                 .child(div().flex_1().min_w_0().child(text)),
         )
+    }
+}
+
+impl Drop for RemoteSession {
+    fn drop(&mut self) {
+        self.finish_session(false);
     }
 }

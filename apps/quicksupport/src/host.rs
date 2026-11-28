@@ -614,6 +614,10 @@ async fn run_incoming_host_session(
     let mut p2p_meta: Option<([u8; 16], [u8; 32])> = None;
     let mut udp_buf = vec![0u8; 2048];
     let mut ka_tick = tokio::time::interval(Duration::from_secs(1));
+    // The viewer pings every 2 s. If nothing arrives for 30 s it is gone (window killed,
+    // network dropped) and the relay keeps our socket open, so end the session here instead of
+    // showing "sesión activa" forever.
+    let mut last_peer_rx = std::time::Instant::now();
     let mut clip_tick = tokio::time::interval(Duration::from_millis(250));
     let mut last_clip_seq = clipboard_sequence_number();
     let mut last_clip_text = read_clipboard_text().unwrap_or_default();
@@ -654,13 +658,17 @@ async fn run_incoming_host_session(
                     }
                 }
             }
-            Some(my_eps) = async {
+            p2p_res = async {
                 match p2p_ep_rx.as_mut() {
-                    Some(rx) => rx.await.ok(),
+                    Some(rx) => rx.await,
                     None => std::future::pending().await,
                 }
             } => {
                 p2p_ep_rx = None;
+                // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                // receiver in place, the next loop polled it again and tokio panicked ("called
+                // after complete"), killing the whole session task: frozen image, no input.
+                let Ok(my_eps) = p2p_res else { continue };
                 if let Some((session_nonce, p2p_key)) = p2p_meta {
                     let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::P2pOffer {
                         session_nonce,
@@ -669,13 +677,17 @@ async fn run_incoming_host_session(
                     })).await;
                 }
             }
-            Some(ch) = async {
+            p2p_res = async {
                 match p2p_ch_rx.as_mut() {
-                    Some(rx) => rx.await.ok(),
+                    Some(rx) => rx.await,
                     None => std::future::pending().await,
                 }
             } => {
                 p2p_ch_rx = None;
+                // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                // receiver in place, the next loop polled it again and tokio panicked ("called
+                // after complete"), killing the whole session task: frozen image, no input.
+                let Ok(ch) = p2p_res else { continue };
                 let addr_str = ch.peer_addr().to_string();
                 agentdesk_protocol::telemetry::tlog("host", format!("P2P UDP ready with {addr_str} after {} ms", t_sess.elapsed().as_millis()));
                 udp_ch = Some(ch);
@@ -691,6 +703,7 @@ async fn run_incoming_host_session(
                 }
             } => {
                 if let Some((n, _)) = udp_recv {
+                    last_peer_rx = std::time::Instant::now();
                     if let Some(pkt) = udp_ch.as_mut().and_then(|c| c.try_feed_datagram(&udp_buf[..n])) {
                         match pkt {
                             DataPacket::Input(ev) => {
@@ -712,6 +725,10 @@ async fn run_incoming_host_session(
                 }
             }
             _ = ka_tick.tick() => {
+                if last_peer_rx.elapsed() > std::time::Duration::from_secs(30) {
+                    agentdesk_capture::hostdiag::log("session ended: no packets from the viewer for 30 s");
+                    break;
+                }
                 if let Some(ch) = udp_ch.as_mut() {
                     ch.maybe_send_keepalive().await;
                     if !ch.is_alive() {
@@ -721,12 +738,12 @@ async fn run_incoming_host_session(
                 }
             }
             Some(cur_pkt) = cursor_rx.recv() => {
-                if send_adaptive_packet(&mut tunnel, &mut udp_ch, &cur_pkt).await.is_err() {
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &cur_pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
                     break;
                 }
             }
             Some(audio_pkt) = audio_rx.recv() => {
-                if send_adaptive_packet(&mut tunnel, &mut udp_ch, &audio_pkt).await.is_err() {
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &audio_pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
                     break;
                 }
             }
@@ -734,6 +751,7 @@ async fn run_incoming_host_session(
                 let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot { resources_json })).await;
             }
             incoming = tunnel.recv_packet() => {
+                last_peer_rx = std::time::Instant::now();
                 match incoming {
                     Ok(DataPacket::Input(ev)) => {
                         if allow_control {
@@ -950,7 +968,7 @@ async fn run_incoming_host_session(
             Some(pkt) = pkt_rx.recv() => {
                 let t_send = std::time::Instant::now();
                 let via_udp = udp_ch.as_ref().map(|c| c.is_alive()).unwrap_or(false);
-                if send_adaptive_packet(&mut tunnel, &mut udp_ch, &pkt).await.is_err() {
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
                     agentdesk_protocol::telemetry::tlog("host", "video send failed; ending session");
                     break;
                 }
@@ -971,6 +989,7 @@ async fn run_incoming_host_session(
         }
     }
 
-    let _ = tunnel.close().await;
+    // A peer that stopped reading would block the close handshake forever.
+    let _ = tokio::time::timeout(Duration::from_secs(3), tunnel.close()).await;
     Ok(())
 }

@@ -1729,7 +1729,14 @@ impl Client {
                 #[cfg(windows)]
                 let _ = apply_win32_window_branding(window, &format!("{label_title} — AgentDesk"));
                 let l = launch_opt.take().expect("single viewer init");
-                cx.new(|cx| RemoteSession::new(l, window, cx))
+                let view = cx.new(|cx| RemoteSession::new(l, window, cx));
+                // Closing the viewer with the window's X must end the session too.
+                let weak_view = view.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let _ = weak_view.update(cx, |this, _| this.finish_session(false));
+                    true
+                });
+                view
             },
         );
     }
