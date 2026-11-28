@@ -2353,6 +2353,30 @@ pub async fn list_downloads(State(state): State<AppState>) -> Json<Vec<DownloadA
     Json(out)
 }
 
+/// Manifiesto firmado de la última versión (lo genera `agentdesk-release-sign`
+/// en la PC de compilación). El servidor no lo modifica: la firma la verifica
+/// el cliente contra su clave compilada.
+pub async fn update_manifest(
+    State(state): State<AppState>,
+    Path(product): Path<String>,
+) -> Result<Response, ApiError> {
+    if product != "desktop" {
+        return Err(ApiError::not_found("unknown product"));
+    }
+    let path = state.artifacts_dir.join(format!("agentdesk-{product}-update.json"));
+    let bytes = fs::read(&path)
+        .await
+        .map_err(|_| ApiError::not_found("no update manifest published"))?;
+    Ok((
+        [
+            (CONTENT_TYPE, "application/json".to_string()),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
 pub async fn download_artifact_file(
     State(state): State<AppState>,
     Path(filename): Path<String>,
