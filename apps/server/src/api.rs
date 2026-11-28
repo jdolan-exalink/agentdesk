@@ -1641,6 +1641,30 @@ pub async fn quick_register_client(
     if req.ed25519_pubkey.len() != 64 {
         return Err(ApiError::bad_request("invalid ed25519 pubkey hex"));
     }
+    // The public key is not a secret (viewers receive it), so registering with it must prove
+    // possession of the private key: otherwise anyone could re-register a device, reset its
+    // access password and take it over.
+    let skew_ms = (Utc::now().timestamp_millis() - req.signed_at_ms).abs();
+    if req.signed_at_ms <= 0 || skew_ms > 5 * 60 * 1000 {
+        return Err(ApiError::unauthorized(
+            "registro sin firma válida (actualizá AgentDesk o revisá la hora del equipo)",
+        ));
+    }
+    let sig_ok = hex::decode(req.signature.trim())
+        .ok()
+        .and_then(|sig| {
+            agentdesk_identity::DeviceIdentity::verify_hex(
+                &req.ed25519_pubkey,
+                agentdesk_protocol::register_proof_message(&req.ed25519_pubkey, req.signed_at_ms)
+                    .as_bytes(),
+                &sig,
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    if !sig_ok {
+        return Err(ApiError::unauthorized("firma de registro inválida"));
+    }
     let trimmed_pw = req.access_password.trim();
     if trimmed_pw.len() < 4 {
         return Err(ApiError::bad_request(
@@ -1914,6 +1938,43 @@ pub async fn lookup_client_by_id(
     }))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswordKind {
+    Access,
+    Personal,
+}
+
+const CONNECT_MAX_FAILURES: u32 = 8;
+const CONNECT_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Rejects a connect attempt when this connection ID already had too many wrong passwords
+/// in the current window.
+fn connect_rate_check(state: &AppState, norm_id: &str) -> Result<(), ApiError> {
+    let mut map = state
+        .connect_failures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    map.retain(|_, (_, start)| now.duration_since(*start) < CONNECT_FAILURE_WINDOW);
+    match map.get(norm_id) {
+        Some((count, _)) if *count >= CONNECT_MAX_FAILURES => Err(ApiError::too_many_requests(
+            "Demasiados intentos fallidos para este ID. Esperá unos minutos.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn connect_rate_fail(state: &AppState, norm_id: &str) {
+    let mut map = state
+        .connect_failures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = map
+        .entry(norm_id.to_string())
+        .or_insert((0, std::time::Instant::now()));
+    entry.0 += 1;
+}
+
 pub async fn connect_by_id(
     State(state): State<AppState>,
     Json(req): Json<DirectConnectRequest>,
@@ -1935,6 +1996,10 @@ pub async fn connect_by_id(
         ));
     }
 
+    // Brute-force guard: an 8-char random password (or a 4+ char personal one) must not be
+    // guessable by hammering this endpoint.
+    connect_rate_check(&state, &norm)?;
+
     let row = sqlx::query(
         "SELECT id, organization_id, hostname, public_code, ed25519_pubkey, access_password_hash, personal_password_hash
          FROM devices
@@ -1952,6 +2017,14 @@ pub async fn connect_by_id(
     let target_connection_id: String = row.get("public_code");
     let device_pubkey: String = row.get("ed25519_pubkey");
 
+    // Checked before the password so a single-use password isn't burned for a host that
+    // can't receive the session.
+    let agent_tx = {
+        let agents = state.active_agents.read().await;
+        agents.get(&device_id).cloned()
+    }
+    .ok_or_else(|| ApiError::conflict("El equipo destino no está conectado al servidor"))?;
+
     let mut authenticated = false;
     if !raw_pw.is_empty() {
         let access_hash: Option<String> = row.get("access_password_hash");
@@ -1959,14 +2032,43 @@ pub async fn connect_by_id(
         // Argon2 is deliberately slow: run it off the async workers and stop at the first match
         // (it used to always hash twice on the request path).
         let pw = raw_pw.to_string();
-        authenticated = tokio::task::spawn_blocking(move || {
-            [access_hash, personal_hash]
-                .iter()
-                .flatten()
-                .any(|h| verify_password(&pw, h).unwrap_or(false))
+        let access_for_check = access_hash.clone();
+        let matched = tokio::task::spawn_blocking(move || {
+            if access_for_check
+                .as_deref()
+                .is_some_and(|h| verify_password(&pw, h).unwrap_or(false))
+            {
+                Some(PasswordKind::Access)
+            } else if personal_hash
+                .as_deref()
+                .is_some_and(|h| verify_password(&pw, h).unwrap_or(false))
+            {
+                Some(PasswordKind::Personal)
+            } else {
+                None
+            }
         })
         .await
-        .unwrap_or(false);
+        .unwrap_or(None);
+        if matched == Some(PasswordKind::Access) {
+            // The random access password is single-use: burn it now, atomically, so it can't be
+            // reused (or raced by a second caller). The host shows a fresh one when the session
+            // ends; until then nobody can get in with a random password.
+            let burned = sqlx::query(
+                "UPDATE devices SET access_password_hash = NULL
+                 WHERE id = $1 AND access_password_hash = $2",
+            )
+            .bind(device_id)
+            .bind(access_hash.as_deref())
+            .execute(&state.pool)
+            .await?;
+            authenticated = burned.rows_affected() == 1;
+        } else {
+            authenticated = matched.is_some();
+        }
+        if !authenticated {
+            connect_rate_fail(&state, &norm);
+        }
     } else if let Some(tok) = reconnect_tok {
         let thash = sha256_hex(tok.as_bytes());
         let valid: Option<Uuid> = sqlx::query_scalar(
@@ -1979,6 +2081,7 @@ pub async fn connect_by_id(
         .await?;
         authenticated = valid.is_some();
         if !authenticated {
+            connect_rate_fail(&state, &norm);
             return Err(ApiError::unauthorized(
                 "La ventana de reconexión de 1 hora expiró. Ingresá la contraseña.",
             ));
@@ -1988,12 +2091,6 @@ pub async fn connect_by_id(
     if !authenticated {
         return Err(ApiError::unauthorized("ID o contraseña incorrectos"));
     }
-
-    let agent_tx = {
-        let agents = state.active_agents.read().await;
-        agents.get(&device_id).cloned()
-    }
-    .ok_or_else(|| ApiError::conflict("El equipo destino no está conectado al servidor"))?;
 
     let session_id = Uuid::new_v4();
     let host_relay_token = generate_high_entropy_token();

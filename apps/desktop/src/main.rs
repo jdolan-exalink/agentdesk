@@ -787,6 +787,10 @@ impl AgentDeskApp {
                 }
                 let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
 
+                let signed_at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
                 let reg_res = http
                     .post(format!("{server}/api/v1/clients/register"))
                     .json(&QuickRegisterRequest {
@@ -803,6 +807,14 @@ impl AgentDeskApp {
                         personal_password: None,
                         mac_addresses,
                         lan_ips,
+                        signed_at_ms,
+                        signature: hex::encode(identity.sign(
+                            agentdesk_protocol::register_proof_message(
+                                &identity.public_key_hex(),
+                                signed_at_ms,
+                            )
+                            .as_bytes(),
+                        )),
                     })
                     .send()
                     .await;

@@ -12,6 +12,7 @@ use agentdesk_protocol::{
     AgentToServerMessage, ControlMessage, DataPacket, FileDropTarget, FrameEncoding,
     QuickRegisterRequest, QuickRegisterResponse, RotatePasswordRequest, ServerToAgentMessage,
 };
+use rand::Rng;
 use agentdesk_transport::{
     connect_ws, enumerate_local_mac_and_ips, send_adaptive_packet, send_wol_magic_packets,
     start_host_p2p_handshake, store_received_file_for_target, verify_sha256_hex, P2pUdpChannel,
@@ -22,7 +23,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{mpsc::Sender, OnceLock};
+use std::sync::{mpsc::Sender, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
@@ -45,6 +46,28 @@ pub fn desktop_identity_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
     base.join("AgentDesk").join("desktop_identity.dpapi")
+}
+
+/// The access password the server currently has for this host. Every (re)registration sends
+/// it, so it must follow each rotation: it used to stay the startup password forever, and any
+/// reconnect to the server quietly brought an old password back.
+static CURRENT_ACCESS_PW: Mutex<String> = Mutex::new(String::new());
+
+fn current_access_pw() -> String {
+    CURRENT_ACCESS_PW.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_current_access_pw(pw: &str) {
+    *CURRENT_ACCESS_PW.lock().unwrap_or_else(|e| e.into_inner()) = pw.to_string();
+}
+
+/// Random single-use access password (8 chars, no look-alike characters).
+pub fn generate_access_password() -> String {
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..8)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 pub enum HostEvent {
@@ -104,13 +127,19 @@ pub fn start_embedded_host(
             .build()
             .unwrap_or_default();
 
-        let access_pw = initial_pw;
+        set_current_access_pw(&initial_pw);
 
         loop {
             if *stop_rx.borrow() {
                 break;
             }
             let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
+            let access_pw = current_access_pw();
+            let signed_at_ms = chrono_now_ms();
+            let signature = hex::encode(identity.sign(
+                agentdesk_protocol::register_proof_message(&identity.public_key_hex(), signed_at_ms)
+                    .as_bytes(),
+            ));
 
             let reg_res = http
                 .post(format!("{server}/api/v1/clients/register"))
@@ -128,6 +157,8 @@ pub fn start_embedded_host(
                     personal_password: None,
                     mac_addresses,
                     lan_ips,
+                    signed_at_ms,
+                    signature,
                 })
                 .send()
                 .await;
@@ -165,7 +196,7 @@ pub fn start_embedded_host(
                 device_id: reg.device_id,
                 connection_id: reg.connection_id.clone(),
                 device_token: reg.device_token.clone(),
-                password: access_pw.clone(),
+                password: access_pw,
             });
 
             let ws_base = if let Some(rest) = server.strip_prefix("https://") {
@@ -275,6 +306,8 @@ pub fn start_embedded_host(
                                 );
                                 let tx_sess = tx.clone();
                                 let local_label = host_name.clone();
+                                let (rot_http, rot_server, rot_id, rot_tok) =
+                                    (http.clone(), server.clone(), reg.device_id, reg.device_token.clone());
                                 tokio::spawn(async move {
                                     let _ = run_incoming_host_session(
                                         relay_url,
@@ -286,6 +319,9 @@ pub fn start_embedded_host(
                                     )
                                     .await;
                                     let _ = tx_sess.send(HostEvent::IncomingEnded);
+                                    // Rotate by default after every session: the password the
+                                    // technician used (and saw) is dead from here on.
+                                    rotate_access_password(&rot_http, &rot_server, rot_id, &rot_tok, &tx_sess).await;
                                 });
                             }
                             ServerToAgentMessage::TerminateSession { session_id, .. } => {
@@ -358,6 +394,46 @@ pub fn start_embedded_host(
     stop_tx
 }
 
+fn chrono_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Pushes a fresh random password to the server (a few retries) and shows it locally.
+async fn rotate_access_password(
+    http: &reqwest::Client,
+    server: &str,
+    device_id: Uuid,
+    device_token: &str,
+    tx: &Sender<HostEvent>,
+) {
+    let new_pw = generate_access_password();
+    // Remember it first: if the HTTP call fails and we re-register later, the server gets this
+    // fresh password, never the one that was just used.
+    set_current_access_pw(&new_pw);
+    for attempt in 0..4u64 {
+        let res = http
+            .post(format!("{server}/api/v1/clients/password"))
+            .header("x-device-token", device_token)
+            .json(&RotatePasswordRequest {
+                device_id,
+                new_password: new_pw.clone(),
+            })
+            .send()
+            .await;
+        if matches!(&res, Ok(r) if r.status().is_success()) {
+            let _ = tx.send(HostEvent::PasswordRotated(new_pw));
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2 + attempt * 3)).await;
+    }
+    let _ = tx.send(HostEvent::Status(
+        "No se pudo renovar la contraseña; se enviará al reconectar".into(),
+    ));
+}
+
 pub fn rotate_password_async(
     server_url: String,
     device_id: Uuid,
@@ -379,6 +455,7 @@ pub fn rotate_password_async(
             .await;
         match res {
             Ok(r) if r.status().is_success() => {
+                set_current_access_pw(&new_password);
                 let _ = tx.send(HostEvent::PasswordRotated(new_password));
             }
             Ok(r) => {

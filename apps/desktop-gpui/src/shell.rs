@@ -837,7 +837,9 @@ impl Client {
             .unwrap_or_else(|| "este equipo".into())
             .to_uppercase();
         let registered = self.local_device_id.is_some();
-        let pw_text = if self.show_local_password {
+        let pw_text = if self.local_password.is_empty() {
+            "—".into()
+        } else if self.show_local_password {
             self.local_password.clone()
         } else {
             "••••••••".into()

@@ -536,7 +536,9 @@ impl Client {
                                             .text_xl()
                                             .font_semibold()
                                             .text_color(rgb(p.text))
-                                            .child(if self.show_local_password {
+                                            .child(if self.local_password.is_empty() {
+                                                "—".into()
+                                            } else if self.show_local_password {
                                                 self.local_password.clone()
                                             } else {
                                                 "••••••••".into()

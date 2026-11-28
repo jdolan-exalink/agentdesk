@@ -263,6 +263,13 @@ struct IncomingSession {
     stop_tx: watch::Sender<bool>,
 }
 
+/// A technician asked to connect and is waiting for the local user's answer.
+struct PendingRequest {
+    caller: String,
+    allow_control: bool,
+    reply: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
 struct QuickSupportApp {
     dark: bool,
     brand_logo: Arc<RenderImage>,
@@ -285,6 +292,7 @@ struct QuickSupportApp {
     status_text: String,
     feedback_text: String,
     incoming: Option<IncomingSession>,
+    pending_request: Option<PendingRequest>,
 
     ticket_code: Option<String>,
     ticket_status: String,
@@ -340,6 +348,7 @@ impl QuickSupportApp {
             status_text: "Conectando con AgentDesk Server…".into(),
             feedback_text: String::new(),
             incoming: None,
+            pending_request: None,
             ticket_code: None,
             ticket_status: String::new(),
             sending_ticket: false,
@@ -402,6 +411,9 @@ impl QuickSupportApp {
             let _ = stop.send(true);
         }
         let srv = self.base_url(cx);
+        if self.password.is_empty() {
+            self.password = generate_password();
+        }
         let pw = self.password.clone();
         self.host_stop = Some(start_embedded_host(srv, pw, None, self.host_tx.clone()));
     }
@@ -411,7 +423,13 @@ impl QuickSupportApp {
         while let Ok(ev) = self.host_rx.try_recv() {
             dirty = true;
             match ev {
-                HostEvent::Status(s) => self.status_text = s,
+                HostEvent::Status(s) => {
+                    // The host gave up waiting (60 s) or the request was answered elsewhere.
+                    if self.pending_request.as_ref().is_some_and(|r| r.reply.as_ref().is_none_or(|t| t.is_closed())) {
+                        self.pending_request = None;
+                    }
+                    self.status_text = s
+                }
                 HostEvent::Registered {
                     device_id,
                     connection_id,
@@ -428,12 +446,35 @@ impl QuickSupportApp {
                     self.password = npw;
                     self.feedback_text = "Contraseña temporal rotada".into();
                 }
+                HostEvent::IncomingRequest {
+                    caller_name,
+                    allow_control,
+                    reply,
+                } => {
+                    self.pending_request = Some(PendingRequest {
+                        caller: caller_name,
+                        allow_control,
+                        reply: Some(reply),
+                    });
+                    #[cfg(windows)]
+                    if let Some(hwnd) = self.main_hwnd {
+                        use windows::Win32::Foundation::HWND;
+                        use windows::Win32::UI::WindowsAndMessaging::{
+                            SetForegroundWindow, ShowWindow, SW_RESTORE,
+                        };
+                        unsafe {
+                            let _ = ShowWindow(HWND(hwnd as *mut _), SW_RESTORE);
+                            let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+                        }
+                    }
+                }
                 HostEvent::IncomingStarted {
                     caller_name,
                     allow_control,
                     stop_tx,
                     chat_tx,
                 } => {
+                    self.password.clear();
                     self.incoming = Some(IncomingSession {
                         caller: caller_name.clone(),
                         allow_control,
@@ -498,6 +539,85 @@ impl QuickSupportApp {
         if dirty {
             cx.notify();
         }
+    }
+
+    fn answer_request(&mut self, accept: bool, cx: &mut Context<Self>) {
+        if let Some(mut req) = self.pending_request.take() {
+            if let Some(reply) = req.reply.take() {
+                let _ = reply.send(accept);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_consent(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.pending_request.as_ref()?;
+        let p = self.palette();
+        let round_btn = |id: &'static str, icon: IconName, bg: u32| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(56.))
+                .rounded_full()
+                .cursor_pointer()
+                .bg(rgb(bg))
+                .text_color(rgb(0xFFFFFF))
+                .hover(|s| s.opacity(0.85))
+                .child(Icon::new(icon).size(px(26.)))
+        };
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .p_5()
+                        .w(px(300.))
+                        .rounded_xl()
+                        .bg(rgb(p.panel))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .child(Icon::new(IconName::ShieldCheck).size(px(34.)).text_color(rgb(p.accent)))
+                        .child(div().text_base().font_bold().child(req.caller.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(rgb(p.muted))
+                                .child(Icon::new(if req.allow_control { IconName::MousePointer } else { IconName::Eye }).size(px(14.)))
+                                .child(if req.allow_control { "quiere ver y controlar este equipo" } else { "quiere ver este equipo" }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_6()
+                                .pt_2()
+                                .child(
+                                    round_btn("qs-consent-no", IconName::X, p.danger)
+                                        .on_click(cx.listener(|this, _, _, cx| this.answer_request(false, cx))),
+                                )
+                                .child(
+                                    round_btn("qs-consent-yes", IconName::Check, p.success)
+                                        .on_click(cx.listener(|this, _, _, cx| this.answer_request(true, cx))),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn rotate_password(&mut self, cx: &mut Context<Self>) {
@@ -581,7 +701,9 @@ impl QuickSupportApp {
 impl Render for QuickSupportApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
+        let consent = self.render_consent(cx);
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -945,6 +1067,7 @@ impl Render for QuickSupportApp {
                     )))
                     .child(self.status_text.clone()),
             )
+            .children(consent)
     }
 }
 

@@ -150,6 +150,13 @@ async fn handle_agent_socket(
                                     .bind(accepted)
                                     .execute(&state.pool)
                                     .await;
+                                    if !accepted {
+                                        // Hang up a viewer already waiting in the relay.
+                                        let rooms = state.relay_rooms.read().await;
+                                        if let Some(close) = rooms.get(&session_id).and_then(|r| r.close_tx.as_ref()) {
+                                            let _ = close.send(true);
+                                        }
+                                    }
                                     record_audit(
                                         &state.pool,
                                         Some(org_id),
@@ -369,13 +376,17 @@ async fn handle_relay_socket(
     let role = if role_is_host { "host" } else { "viewer" };
     let sess_short = session_id.to_string()[..8].to_string();
 
-    let (both_connected, wait_ms, flushed) = {
+    let (both_connected, wait_ms, flushed, mut closed_rx) = {
         let mut rooms = state.relay_rooms.write().await;
         let room = rooms.entry(session_id).or_default();
         let flushed = if role_is_host { room.pending_for_host.len() } else { room.pending_for_viewer.len() };
         let first = *room.first_join.get_or_insert_with(std::time::Instant::now);
         let both = register_relay_peer(room, role_is_host, tx.clone());
-        (both, first.elapsed().as_millis(), flushed)
+        let closed = room
+            .close_tx
+            .get_or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe();
+        (both, first.elapsed().as_millis(), flushed, closed)
     };
     if both_connected {
         tracing::info!(
@@ -433,6 +444,13 @@ async fn handle_relay_socket(
     loop {
         tokio::select! {
             _ = &mut send_task => break,
+            Ok(()) = closed_rx.changed() => {
+                let closed = *closed_rx.borrow();
+                if closed {
+                    tracing::info!("relay[{sess_short}] {role} closed: session rejected by the host");
+                    break;
+                }
+            }
             _ = report.tick() => {
                 let peer_q = {
                     let rooms = state.relay_rooms.read().await;

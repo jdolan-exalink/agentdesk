@@ -471,6 +471,19 @@ pub struct QuickRegisterRequest {
     pub mac_addresses: Vec<String>,
     #[serde(default)]
     pub lan_ips: Vec<String>,
+    /// Proof that the caller holds the device's ed25519 private key: unix ms when it signed.
+    /// Without it anyone who learned a device's public key (every viewer gets it) could
+    /// re-register that device and set its access password.
+    #[serde(default)]
+    pub signed_at_ms: i64,
+    /// Hex ed25519 signature over [`register_proof_message`].
+    #[serde(default)]
+    pub signature: String,
+}
+
+/// Message a host signs to prove it owns `ed25519_pubkey` when it calls `/clients/register`.
+pub fn register_proof_message(ed25519_pubkey: &str, signed_at_ms: i64) -> String {
+    format!("agentdesk-register-v1:{ed25519_pubkey}:{signed_at_ms}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

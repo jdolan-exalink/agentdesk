@@ -127,6 +127,8 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             screen_width: 1920,
             screen_height: 1080,
             private_mem_mb: 18.5,
+            mac_addresses: vec![],
+            lan_ips: vec![],
         })
         .send()
         .await
@@ -312,6 +314,11 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
 
     // 9. Instant Peer ID + Random Password Flow
     let peer_id = DeviceIdentity::generate();
+    let signed_at_ms = chrono::Utc::now().timestamp_millis();
+    let signature = hex::encode(peer_id.sign(
+        agentdesk_protocol::register_proof_message(&peer_id.public_key_hex(), signed_at_ms)
+            .as_bytes(),
+    ));
     let reg: QuickRegisterResponse = client
         .post(format!("{base}/api/v1/clients/register"))
         .json(&QuickRegisterRequest {
@@ -326,6 +333,10 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             access_password: "init9999".into(),
             owner_email: None,
             personal_password: None,
+            mac_addresses: vec![],
+            lan_ips: vec![],
+            signed_at_ms,
+            signature,
         })
         .send()
         .await
@@ -392,6 +403,37 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
     assert_eq!(ok_conn.target_connection_id, reg.connection_id);
     assert!(ok_conn.reconnect_token.is_some());
     assert!(ok_conn.relay_ws_path.contains(&ok_conn.session_id.to_string()));
+
+    // The random password is single-use: a second connect with it must fail.
+    let reuse = client
+        .post(format!("{base}/api/v1/sessions/connect-by-id"))
+        .json(&DirectConnectRequest {
+            connection_id: reg.connection_id.clone(),
+            password: "rotated88".into(),
+            reconnect_token: None,
+            caller_name: Some("Replay".into()),
+            allow_control: true,
+            allow_clipboard: true,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reuse.status(), StatusCode::UNAUTHORIZED);
+
+    // Knowing the public key is not enough to re-register (and reset the password of) a device.
+    let hijack = client
+        .post(format!("{base}/api/v1/clients/register"))
+        .json(&serde_json::json!({
+            "ed25519_pubkey": peer_id.public_key_hex(),
+            "hostname": "ATTACKER",
+            "os_name": "x", "os_arch": "x", "agent_version": "0",
+            "screen_width": 1, "screen_height": 1, "private_mem_mb": 1.0,
+            "access_password": "pwned123",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hijack.status(), StatusCode::UNAUTHORIZED);
 
     // 10. Public /docs, /support/status, Calendar overlap 409, MFA setup/verify, CSV report, AI OAuth PKCE & MCP
     for pub_path in ["/docs", "/support/status", "/api/v1/docs"] {
@@ -508,7 +550,12 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
     assert_eq!(re_login.status(), StatusCode::OK);
 
     // Quick register peer with personal password + owner_email, connect with personal pw & 1h reconnect_token
-    let pk_hex = DeviceIdentity::generate().public_key_hex();
+    let peer2 = DeviceIdentity::generate();
+    let pk_hex = peer2.public_key_hex();
+    let signed2 = chrono::Utc::now().timestamp_millis();
+    let sig2 = hex::encode(peer2.sign(
+        agentdesk_protocol::register_proof_message(&pk_hex, signed2).as_bytes(),
+    ));
     let reg_resp: agentdesk_protocol::QuickRegisterResponse = client
         .post(format!("{base}/api/v1/clients/register"))
         .json(&serde_json::json!({
@@ -522,7 +569,9 @@ async fn end_to_end_control_plane_tenant_isolation_and_blind_relay() {
             "private_mem_mb": 42.0,
             "access_password": "RandPass99",
             "owner_email": "admin@alpha.test",
-            "personal_password": "FixedPersonal77!"
+            "personal_password": "FixedPersonal77!",
+            "signed_at_ms": signed2,
+            "signature": sig2
         }))
         .send()
         .await

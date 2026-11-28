@@ -12,6 +12,7 @@ path = "src/main.rs"
 agentdesk-ai.workspace = true
 agentdesk-identity.workspace = true
 agentdesk-protocol.workspace = true
+hex.workspace = true
 agentdesk-rmm.workspace = true
 agentdesk-transport.workspace = true
 anyhow.workspace = true

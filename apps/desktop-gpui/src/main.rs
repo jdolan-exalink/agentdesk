@@ -895,6 +895,9 @@ impl Client {
             let t = self.cfg.owner_email.trim().to_string();
             if t.is_empty() { None } else { Some(t) }
         };
+        if self.local_password.is_empty() {
+            self.local_password = generate_access_password();
+        }
         self.host_stop = Some(start_embedded_host(
             srv,
             self.local_password.clone(),
@@ -931,6 +934,9 @@ impl Client {
                     stop_tx,
                     chat_tx,
                 } => {
+                    // The password was single-use and is already dead; a new one appears when
+                    // the session ends (never on screen while someone is watching it).
+                    self.local_password.clear();
                     self.incoming_control = Some(IncomingControl {
                         caller_name: caller_name.clone(),
                         allow_control,

@@ -18,7 +18,13 @@ pub struct RelayRoom {
     pub pending_for_viewer: Vec<Vec<u8>>,
     /// When the first peer joined; used to log how long the other side took to arrive.
     pub first_join: Option<std::time::Instant>,
+    /// Fires when the session is closed server-side (e.g. the host's user rejected it), so the
+    /// relay sockets already waiting in this room hang up instead of waiting forever.
+    pub close_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
+
+/// Failed password attempts per connection ID: (failures in window, window start).
+pub type ConnectFailures = Arc<std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +39,7 @@ pub struct AppState {
     pub bind_addr: String,
     pub lan_ip: Option<String>,
     pub public_url: String,
+    pub connect_failures: ConnectFailures,
 }
 
 impl AppState {
@@ -50,6 +57,7 @@ impl AppState {
             bind_addr: "0.0.0.0:8080".to_string(),
             lan_ip: None,
             public_url: "http://127.0.0.1:8080".to_string(),
+            connect_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -110,6 +118,12 @@ impl ApiError {
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: msg.into(),
         }
     }

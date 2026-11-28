@@ -319,19 +319,25 @@ pub fn install_host_service_elevated(server_url: &str, enroll_token: &str) -> Re
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || ":/._-[]%?=".contains(c))
     };
-    if !safe(server) || !safe(token) {
+    let token_ok = token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !safe(server) || !token_ok {
         return Err("La URL del servidor o el token contienen caracteres no válidos".into());
     }
 
+    // The token never goes in the service command line (its ImagePath is readable by every
+    // local user): it is written to a one-shot file only SYSTEM and Administrators can read;
+    // the service enrolls with it on first start and deletes it.
     // sc.exe interpreta \" como comilla literal dentro de binPath=.
     let bin_path = format!(
-        "\"\\\"{}\\\" --service --server {} --enroll-token {} --auto-accept\"",
+        "\"\\\"{}\\\" --service --server {} --auto-accept\"",
         host_exe.display(),
         server,
-        token
     );
+    let tok_file = r#""%ProgramData%\AgentDesk\host-enroll.token""#;
     let params = format!(
-        "/c \"echo Instalando el servicio AgentDeskHost... & sc.exe stop AgentDeskHost >nul 2>&1 & sc.exe delete AgentDeskHost >nul 2>&1 & timeout /t 2 /nobreak >nul & sc.exe create AgentDeskHost binPath= {bin_path} start= auto DisplayName= \"AgentDesk Host (acceso desatendido)\" & sc.exe start AgentDeskHost & timeout /t 5\""
+        "/c \"echo Instalando el servicio AgentDeskHost... & sc.exe stop AgentDeskHost >nul 2>&1 & sc.exe delete AgentDeskHost >nul 2>&1 & timeout /t 2 /nobreak >nul & (if not exist \"%ProgramData%\\AgentDesk\" mkdir \"%ProgramData%\\AgentDesk\") & (echo {token})> {tok_file} & icacls {tok_file} /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F >nul & sc.exe create AgentDeskHost binPath= {bin_path} start= auto DisplayName= \"AgentDesk Host (acceso desatendido)\" & sc.exe start AgentDeskHost & timeout /t 5\""
     );
     let verb = to_wide("runas");
     let file = to_wide("cmd.exe");

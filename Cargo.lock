@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-ai"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-rmm",
  "anyhow",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-capture"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-protocol",
  "chrono",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-desktop"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-capture",
  "agentdesk-identity",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-desktop-gpui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-capture",
  "agentdesk-identity",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-capture",
  "agentdesk-identity",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-identity"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-protocol"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bincode",
  "chrono",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-quicksupport"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-capture",
  "agentdesk-identity",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-rmm"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "hostname",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-ai",
  "agentdesk-identity",
@@ -452,6 +452,7 @@ dependencies = [
  "data-encoding",
  "embed-resource",
  "futures-util",
+ "hex",
  "hmac",
  "rand 0.8.8",
  "reqwest",
@@ -471,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-server-console"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -489,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "agentdesk-transport"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentdesk-identity",
  "agentdesk-protocol",

@@ -98,6 +98,71 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn enroll_token_file() -> PathBuf {
+    std::env::var("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("AgentDesk")
+        .join("host-enroll.token")
+}
+
+fn read_enroll_token_file() -> Option<String> {
+    let raw = std::fs::read_to_string(enroll_token_file()).ok()?;
+    let tok = raw.trim_start_matches('\u{feff}').trim().to_string();
+    (!tok.is_empty()).then_some(tok)
+}
+
+fn remove_enroll_token_file() {
+    let _ = std::fs::remove_file(enroll_token_file());
+}
+
+/// Rewrites this service's command line without `--enroll-token <secret>` (services
+/// installed by AgentDesk <= 0.1.6 had it there, readable by any local user).
+#[cfg(windows)]
+fn scrub_service_enroll_token() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut kept: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--enroll-token" {
+            let _ = args.next();
+            continue;
+        }
+        if a.starts_with("--enroll-token=") {
+            continue;
+        }
+        kept.push(a);
+    }
+    if !kept.iter().any(|a| a == "--service") {
+        kept.insert(0, "--service".into());
+    }
+    // sc.exe reads \" as a literal quote inside binPath=.
+    let quote = |s: &str| {
+        if s.contains(' ') {
+            format!(r#"\"{s}\""#)
+        } else {
+            s.to_string()
+        }
+    };
+    let mut bin = format!(r#"\"{}\""#, exe.display());
+    for a in &kept {
+        bin.push(' ');
+        bin.push_str(&quote(a));
+    }
+    let status = std::process::Command::new("sc.exe")
+        .args(["config", win_service::SERVICE_NAME, "binPath="])
+        .raw_arg(format!("\"{bin}\""))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status();
+    match status {
+        Ok(st) if st.success() => {
+            tracing::info!("Enrollment token removed from the service command line")
+        }
+        other => tracing::warn!(?other, "Could not remove the enrollment token from the service command line"),
+    }
+}
+
 fn identity_path() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -400,10 +465,29 @@ async fn run_agent(
         "quicksupport"
     };
 
+    // The enrollment token is a secret: it must never live in the service command line
+    // (the service's ImagePath in the registry is readable by every local user). Installers
+    // drop it in an admin-only one-shot file instead; env var and CLI still work for manual runs.
+    let file_token = if cli.mode == AgentMode::Host { read_enroll_token_file() } else { None };
+    let has_saved_creds = host_cfg_opt
+        .as_ref()
+        .is_some_and(|(c, _)| c.device_id.is_some() && c.device_token.is_some());
+    let enroll_token: Option<String> = file_token
+        .clone()
+        .or_else(|| {
+            std::env::var("AGENTDESK_ENROLL_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        // A service installed by an older version still carries the token: once enrolled,
+        // ignore it instead of re-enrolling on every start.
+        .or_else(|| if cli.service && has_saved_creds { None } else { cli.enroll_token.clone() });
+
     let (device_id, public_code, device_token) = if let Some((ref mut cfg, ref cfg_path)) =
         host_cfg_opt
     {
-        if cli.enroll_token.is_none() {
+        if enroll_token.is_none() {
             if let (Some(did), Some(dtok)) = (cfg.device_id, cfg.device_token.clone()) {
                 let pcode = cfg
                     .public_code
@@ -455,7 +539,7 @@ async fn run_agent(
             let resp: EnrollDeviceResponse = http
                 .post(format!("{server}/api/v1/devices/enroll"))
                 .json(&EnrollDeviceRequest {
-                    enrollment_token: cli.enroll_token.clone(),
+                    enrollment_token: enroll_token.clone(),
                     support_code: cli.support_code.clone(),
                     ed25519_pubkey: identity.public_key_hex(),
                     hostname: host_name.clone(),
@@ -481,6 +565,9 @@ async fn run_agent(
             cfg.fps = effective_fps;
             cfg.quality = effective_quality;
             cfg.save(cfg_path)?;
+            if file_token.is_some() {
+                remove_enroll_token_file();
+            }
             (resp.device_id, resp.public_code, resp.device_token)
         }
     } else {
@@ -510,6 +597,11 @@ async fn run_agent(
             .await?;
         (resp.device_id, resp.public_code, resp.device_token)
     };
+
+    #[cfg(windows)]
+    if cli.service && cli.enroll_token.is_some() {
+        scrub_service_enroll_token();
+    }
 
     tracing::info!(
         %device_id,
