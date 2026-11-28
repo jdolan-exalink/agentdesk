@@ -5,6 +5,11 @@
 
 use std::io::Write;
 
+/// `%LOCALAPPDATA%\AgentDesk\logs`.
+pub fn log_dir_path() -> std::path::PathBuf {
+    log_path().parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir)
+}
+
 fn log_path() -> std::path::PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(std::path::PathBuf::from)

@@ -110,7 +110,7 @@ mod win_mf {
         MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
         MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-        MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+        MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
         MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
         MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
         MF_VERSION, MFSTARTUP_NOSOCKET,
@@ -640,6 +640,12 @@ mod win_mf {
                     let Ok(mft) = a.ActivateObject::<IMFTransform>() else {
                         continue;
                     };
+                    // Without this the Windows decoder keeps a full reorder buffer: measured
+                    // ~36 frames of delay, i.e. seconds on a mostly static desktop. Both the
+                    // attribute and the codec API flag are needed across decoder versions.
+                    if let Ok(attrs) = mft.GetAttributes() {
+                        let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                    }
                     if let Ok(capi) = mft.cast::<ICodecAPI>() {
                         let _ = capi.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
                     }

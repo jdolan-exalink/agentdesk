@@ -109,6 +109,8 @@ pub fn start_embedded_host(
     let server = server_url.trim_end_matches('/').to_string();
     let _ = tx.send(HostEvent::Status(format!("Conectando a {server}…")));
 
+    // Put back a wallpaper left black by a host session that crashed.
+    std::thread::spawn(WallpaperBlackoutGuard::restore_leftover);
     runtime().spawn(async move {
         let identity = match DeviceIdentity::load_or_create(&desktop_identity_path()) {
             Ok(id) => id,
@@ -245,6 +247,7 @@ pub fn start_embedded_host(
 
             let hb_tx = ctrl_tx.clone();
             let hb_stop = stop_rx.clone();
+            agentdesk_protocol::telemetry::enable_forwarding();
             let hb_task = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(15));
                 loop {
@@ -260,6 +263,9 @@ pub fn start_embedded_host(
                         mac_addresses,
                         lan_ips,
                     });
+                    for (role, lines) in agentdesk_protocol::telemetry::drain_for_server() {
+                        let _ = hb_tx.send(AgentToServerMessage::Telemetry { role, lines });
+                    }
                 }
             });
 

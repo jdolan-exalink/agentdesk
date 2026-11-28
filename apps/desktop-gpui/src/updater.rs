@@ -24,7 +24,8 @@ pub const RELEASE_PUBKEY_HEX: &str = "64299d5e222291646ab16c088d14553d205086b046
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PRODUCT: &str = "desktop";
 const FIRST_CHECK: Duration = Duration::from_secs(20);
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// Mientras el cliente está abierto consulta cada minuto (pedido de Juan).
+const CHECK_EVERY: Duration = Duration::from_secs(60);
 const MAX_SIZE: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,8 @@ pub struct Updater {
     pub dismissed: bool,
     pub progress: Arc<AtomicU64>,
     pub last_check: Option<chrono::DateTime<chrono::Local>>,
+    /// Hay una consulta en curso (la automática no pasa por `Checking`).
+    pub in_flight: bool,
 }
 
 impl Default for Updater {
@@ -55,6 +58,7 @@ impl Default for Updater {
             dismissed: false,
             progress: Arc::new(AtomicU64::new(0)),
             last_check: None,
+            in_flight: false,
         }
     }
 }
@@ -292,7 +296,7 @@ fn reveal_in_explorer(path: &Path) {
 // ---------------------------------------------------------------------------
 
 impl Client {
-    /// Primera consulta a los 20 s y luego cada 6 h. Nunca instala sola.
+    /// Primera consulta a los 20 s y luego cada minuto. Nunca instala sola.
     pub fn schedule_update_checks(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut wait = FIRST_CHECK;
@@ -310,20 +314,38 @@ impl Client {
     pub fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         match self.updater.state {
             UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Installing(_) => return,
+            // La consulta de cada minuto no pisa el aviso de "ejecutalo a mano".
+            UpdateState::Manual(..) if !manual => return,
             _ => {}
         }
-        let base = self.base_url(cx);
-        let prev = std::mem::replace(&mut self.updater.state, UpdateState::Checking);
-        if manual {
-            cx.notify();
+        if self.updater.in_flight {
+            return;
         }
+        self.updater.in_flight = true;
+        let base = self.base_url(cx);
+        // La consulta automática corre en silencio: el panel no parpadea cada minuto.
+        let prev = if manual {
+            let prev = std::mem::replace(&mut self.updater.state, UpdateState::Checking);
+            cx.notify();
+            prev
+        } else {
+            self.updater.state.clone()
+        };
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { fetch_update(&base) })
                 .await;
             this.update(cx, |this, cx| {
+                this.updater.in_flight = false;
                 this.updater.last_check = Some(chrono::Local::now());
+                // Si mientras tanto el usuario aceptó actualizar, no lo pisamos.
+                if matches!(
+                    this.updater.state,
+                    UpdateState::Downloading(_) | UpdateState::Installing(_) | UpdateState::Manual(..)
+                ) {
+                    return;
+                }
                 this.updater.state = match res {
                     Ok(Some(info)) => UpdateState::Available(info),
                     Ok(None) => UpdateState::UpToDate,

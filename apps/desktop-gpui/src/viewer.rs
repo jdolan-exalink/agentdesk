@@ -1454,6 +1454,32 @@ impl Render for RemoteSession {
                                 if !this.allow_control {
                                     return;
                                 }
+                                // Shortcuts (Ctrl+C, Ctrl+V, Alt+F4, Win+E...): GPUI does not send
+                                // key-down for the modifiers themselves and letters were never sent
+                                // as key-down, so the remote only got "C up". Replay the whole
+                                // chord as virtual keys instead of typing a character.
+                                let m = &ev.keystroke.modifiers;
+                                if m.control || m.alt || m.platform {
+                                    if let Some(vk) = map_gpui_key_to_vk(&ev.keystroke.key) {
+                                        if !matches!(vk, 0x10 | 0x11 | 0x12) {
+                                            let mut mods: Vec<u16> = Vec::new();
+                                            if m.control { mods.push(0x11); }
+                                            if m.alt { mods.push(0x12); }
+                                            if m.shift { mods.push(0x10); }
+                                            if m.platform { mods.push(0x5B); }
+                                            let key = |vk: u16, pressed: bool| DataPacket::Input(InputEvent::Key { vk, pressed });
+                                            for &k in &mods {
+                                                let _ = this.out_tx.send(key(k, true));
+                                            }
+                                            let _ = this.out_tx.send(key(vk, true));
+                                            let _ = this.out_tx.send(key(vk, false));
+                                            for &k in mods.iter().rev() {
+                                                let _ = this.out_tx.send(key(k, false));
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
                                 if !ev.is_held {
                                     if let Some(kc) = &ev.keystroke.key_char {
                                         for ch in kc.chars() {

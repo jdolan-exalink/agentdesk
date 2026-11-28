@@ -4,6 +4,13 @@ Cada sección `## X.Y.Z — fecha` con viñetas `- ...` es lo que el cliente mue
 al ofrecer una actualización (lo firma `agentdesk-release-sign`). Escribí las
 viñetas pensando en el técnico que las va a leer, no en el código.
 
+## 0.1.10 — 2026-11-28
+- Mucho menos delay: el visor mostraba cada imagen con varios segundos de atraso cuando la pantalla remota cambiaba poco. Ahora se ve al instante.
+- Ctrl+C, Ctrl+V y los demás atajos de teclado funcionan en el equipo remoto.
+- El fondo de pantalla del equipo remoto vuelve siempre a la normalidad, aunque la sesión se corte de golpe.
+- Los datos de calidad de conexión del cliente y del equipo remoto se envían al servidor para seguir mejorando la velocidad.
+- El cliente busca actualizaciones cada minuto mientras está abierto.
+
 ## 0.1.9 — 2026-11-28
 - Actualizaciones automáticas del cliente: avisa cuando hay una versión nueva, muestra qué cambió y solo instala si aceptás.
 - Cada actualización viene firmada por AgentDesk y se verifica (firma y SHA-256) antes de instalarla.

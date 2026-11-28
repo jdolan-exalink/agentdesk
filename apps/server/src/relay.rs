@@ -219,6 +219,33 @@ async fn handle_agent_socket(
                                         "peer Wake-on-LAN relay reported"
                                     );
                                 }
+                                AgentToServerMessage::Telemetry { role, lines } => {
+                                    let role: String = role.chars().take(24).collect();
+                                    let lines: Vec<String> = lines
+                                        .into_iter()
+                                        .take(600)
+                                        .map(|l| l.chars().take(1000).collect())
+                                        .collect();
+                                    for l in &lines {
+                                        tracing::info!("telemetry[{public_code}] {role}: {l}");
+                                    }
+                                    let _ = sqlx::query(
+                                        "INSERT INTO client_telemetry (device_id, role, line)
+                                         SELECT $1, $2, unnest($3::text[])",
+                                    )
+                                    .bind(device_id)
+                                    .bind(&role)
+                                    .bind(&lines)
+                                    .execute(&state.pool)
+                                    .await;
+                                    // Keep two weeks; cheap enough to do on each batch.
+                                    let _ = sqlx::query(
+                                        "DELETE FROM client_telemetry WHERE device_id = $1 AND created_at < now() - interval '14 days'",
+                                    )
+                                    .bind(device_id)
+                                    .execute(&state.pool)
+                                    .await;
+                                }
                             }
                         }
                     }

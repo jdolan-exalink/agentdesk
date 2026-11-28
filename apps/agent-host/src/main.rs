@@ -637,6 +637,7 @@ async fn run_agent(
                     }
                 });
 
+                agentdesk_protocol::telemetry::enable_forwarding();
                 let hb_tx = ctrl_tx.clone();
                 let hb_task = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -650,6 +651,9 @@ async fn run_agent(
                             mac_addresses,
                             lan_ips,
                         });
+                        for (role, lines) in agentdesk_protocol::telemetry::drain_for_server() {
+                            let _ = hb_tx.send(AgentToServerMessage::Telemetry { role, lines });
+                        }
                     }
                 });
 

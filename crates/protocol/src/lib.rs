@@ -359,6 +359,12 @@ pub enum AgentToServerMessage {
         sent_count: usize,
         detail: String,
     },
+    /// Connection-quality telemetry (host and viewer lines from this app), batched. Older
+    /// servers ignore unknown messages.
+    Telemetry {
+        role: String,
+        lines: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

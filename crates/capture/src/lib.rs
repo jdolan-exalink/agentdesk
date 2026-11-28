@@ -1213,7 +1213,36 @@ pub mod win {
             crate::BackgroundWallpaperGuard::start()
         }
 
+        fn restore_marker() -> std::path::PathBuf {
+            crate::hostdiag::log_dir_path().join("wallpaper-restore.txt")
+        }
+
+        /// A host that died mid-session (crash, killed process) never ran Drop, leaving the
+        /// desktop black; the next session then saved "" as the original and the wallpaper was
+        /// gone for good. Put back the wallpaper recorded by that session first.
+        pub fn restore_leftover() {
+            let marker = Self::restore_marker();
+            let Ok(saved) = std::fs::read_to_string(&marker) else {
+                return;
+            };
+            let saved = saved.trim();
+            if !saved.is_empty() {
+                let wide: Vec<u16> = saved.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe {
+                    let _ = SystemParametersInfoW(
+                        SPI_SETDESKWALLPAPER,
+                        0,
+                        Some(wide.as_ptr() as *mut _),
+                        SPIF_SENDCHANGE,
+                    );
+                }
+                crate::hostdiag::log(&format!("wallpaper restored from a previous session: {saved}"));
+            }
+            let _ = std::fs::remove_file(marker);
+        }
+
         pub fn activate() -> Self {
+            Self::restore_leftover();
             unsafe {
                 let mut path_buf = vec![0u16; 520];
                 let got_wp = SystemParametersInfoW(
@@ -1239,6 +1268,15 @@ pub mod win {
                 if !got_wp {
                     path_buf.clear();
                 }
+                let n = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+                let orig = String::from_utf16_lossy(&path_buf[..n]);
+                if !orig.is_empty() {
+                    let marker = Self::restore_marker();
+                    if let Some(dir) = marker.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&marker, &orig);
+                }
                 Self {
                     original_wallpaper: path_buf,
                     original_color: orig_color,
@@ -1253,6 +1291,7 @@ pub mod win {
             if !self.active {
                 return;
             }
+            let _ = std::fs::remove_file(Self::restore_marker());
             unsafe {
                 let elem = [COLOR_DESKTOP.0];
                 let cols = [COLORREF(self.original_color)];

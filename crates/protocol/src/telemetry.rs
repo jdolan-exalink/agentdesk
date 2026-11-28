@@ -29,6 +29,39 @@ pub fn tlog(role: &str, line: impl AsRef<str>) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{} [{role}] {}", now.format("%H:%M:%S%.3f"), line.as_ref());
     }
+    if FORWARD.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(mut q) = PENDING.lock() {
+            if q.len() < MAX_PENDING {
+                q.push((role.to_string(), format!("{} {}", now.format("%H:%M:%S%.3f"), line.as_ref())));
+            }
+        }
+    }
+}
+
+/// Lines waiting to be sent to the server (bounded: a host offline for hours must not grow).
+static PENDING: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static FORWARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const MAX_PENDING: usize = 600;
+
+/// Also queue every telemetry line for the server (the app's agent connection drains it).
+pub fn enable_forwarding() {
+    FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the queued lines grouped by role, oldest first.
+pub fn drain_for_server() -> Vec<(String, Vec<String>)> {
+    let lines = match PENDING.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (role, line) in lines {
+        match out.iter_mut().find(|(r, _)| *r == role) {
+            Some((_, v)) => v.push(line),
+            None => out.push((role, vec![line])),
+        }
+    }
+    out
 }
 
 /// Simple running stats bucket (count / sum / max) reset on every report.
