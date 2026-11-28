@@ -1918,6 +1918,7 @@ pub async fn connect_by_id(
     State(state): State<AppState>,
     Json(req): Json<DirectConnectRequest>,
 ) -> Result<Json<DirectConnectResponse>, ApiError> {
+    let t_req = std::time::Instant::now();
     let norm = normalize_connection_id(&req.connection_id);
     if norm.is_empty() {
         return Err(ApiError::bad_request("connection_id requerido"));
@@ -2040,6 +2041,12 @@ pub async fn connect_by_id(
     .await;
 
     let relay_ws_path = format!("/ws/relay/{session_id}");
+    tracing::info!(
+        "relay[{}] session created by connect-by-id for {} in {} ms (auth + db); pushing IncomingSession to agent",
+        &session_id.to_string()[..8],
+        target_connection_id,
+        t_req.elapsed().as_millis()
+    );
     let _ = agent_tx.send(ServerToAgentMessage::IncomingSession {
         session_id,
         technician_name: caller_label.clone(),

@@ -1,6 +1,7 @@
 use crate::h264::{MfH264Decoder, MfH264Encoder};
 use crate::win::WindowsCapturer;
 use crate::{decode_frame_to_bgra, CaptureError, ScreenCapturer};
+use agentdesk_protocol::telemetry::{tlog, Stat};
 use agentdesk_protocol::{ControlMessage, DataPacket, FrameEncoding, VideoFrame};
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
 use std::collections::{HashSet, VecDeque};
@@ -209,6 +210,10 @@ impl AbrController {
 
     pub fn smoothed_rtt_ms(&self) -> Option<f32> {
         self.ewma_rtt_ms
+    }
+
+    pub fn min_rtt_ms(&self) -> Option<f32> {
+        self.min_rtt_ms
     }
 }
 
@@ -803,6 +808,18 @@ pub fn spawn_capture_worker(
         let mut refine_left = 0u8;
         let mut last_video_sent = Instant::now();
         let worker_started = Instant::now();
+        // Telemetry window (reported every 2 s to the host log).
+        let mut st_report = Instant::now();
+        let mut st_changed = 0u32;
+        let mut st_sent = 0u32;
+        let mut st_bytes = 0u64;
+        let mut st_max_frame = 0usize;
+        let mut st_kf = 0u32;
+        let mut st_gate_window_ms = 0u32;
+        let mut st_gate_queue_ms = 0u32;
+        let mut st_encode = Stat::default();
+        let mut st_first_frame_logged = false;
+        tlog("host", format!("capture worker started (monitor {active_mon})"));
         // Set when an async (hardware) encoder accepted a frame but has not returned it yet.
         // Its output must be collected even if the screen never changes again, otherwise a
         // static remote desktop leaves the viewer without a first image forever.
@@ -859,13 +876,61 @@ pub fn spawn_capture_worker(
 
             // Never encode a frame we cannot hand to the network task right away: a dropped
             // H.264 frame corrupts every following P-frame until the next IDR.
+            if st_report.elapsed() >= Duration::from_secs(2) {
+                let secs = st_report.elapsed().as_secs_f32();
+                let g = abr.lock().unwrap();
+                let enc = st_encode.take();
+                tlog(
+                    "host",
+                    format!(
+                        "video: changed {:.1}/s sent {:.1} fps {:.0} kB/s (avg {:.1} kB, max {} kB) kf {} | encode avg {:.1} ms max {:.1} ms | codec {} src {}x{} | q {} fps_cap {} max_w {} | rtt {:.0} ms min {:.0} queue_delay {:.0} | in_flight {}/{} | blocked: window {} ms, net queue {} ms",
+                        st_changed as f32 / secs,
+                        st_sent as f32 / secs,
+                        st_bytes as f32 / secs / 1024.0,
+                        if st_sent > 0 { st_bytes as f32 / st_sent as f32 / 1024.0 } else { 0.0 },
+                        st_max_frame / 1024,
+                        st_kf,
+                        enc.avg(),
+                        enc.max,
+                        if last_codec_label.is_empty() { "-" } else { last_codec_label.as_str() },
+                        last_dims.map(|d| d.0).unwrap_or(0),
+                        last_dims.map(|d| d.1).unwrap_or(0),
+                        g.config.jpeg_quality,
+                        g.config.max_fps,
+                        g.config.max_width,
+                        g.smoothed_rtt_ms().unwrap_or(0.0),
+                        g.min_rtt_ms().unwrap_or(0.0),
+                        g.queue_delay_ms(),
+                        g.in_flight(),
+                        g.window(),
+                        st_gate_window_ms,
+                        st_gate_queue_ms,
+                    ),
+                );
+                drop(g);
+                st_report = Instant::now();
+                st_changed = 0;
+                st_sent = 0;
+                st_bytes = 0;
+                st_max_frame = 0;
+                st_kf = 0;
+                st_gate_window_ms = 0;
+                st_gate_queue_ms = 0;
+            }
+
             if !can_send || pkt_tx.capacity() == 0 {
+                if !can_send {
+                    st_gate_window_ms += 2;
+                } else {
+                    st_gate_queue_ms += 2;
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
 
             let force_kf = keyframe_req.swap(false, Ordering::Relaxed);
             if force_kf {
+                st_kf += 1;
                 encoder.force_keyframe();
             }
 
@@ -879,6 +944,7 @@ pub fn spawn_capture_worker(
                 Ok(Some(dims)) => {
                     last_dims = Some(dims);
                     refine_left = 3;
+                    st_changed += 1;
                     Some(dims)
                 }
                 Ok(None) => {
@@ -926,8 +992,16 @@ pub fn spawn_capture_worker(
                                 encoding: FrameEncoding::H264AnnexB,
                                 payload: annex_b,
                             });
+                            let sent_len = match &pkt { DataPacket::VideoFrame(v) => v.payload.len(), _ => 0 };
                             if pkt_tx.try_send(pkt).is_ok() {
                                 abr.lock().unwrap().on_frame_sent(seq);
+                                st_sent += 1;
+                                st_bytes += sent_len as u64;
+                                st_max_frame = st_max_frame.max(sent_len);
+                                if !st_first_frame_logged {
+                                    st_first_frame_logged = true;
+                                    tlog("host", format!("first video frame sent {} ms after worker start ({} kB)", worker_started.elapsed().as_millis(), sent_len / 1024));
+                                }
                                 last_video_sent = Instant::now();
                                 last_sent_h264 = true;
                             } else {
@@ -936,6 +1010,7 @@ pub fn spawn_capture_worker(
                         }
                         Ok(None) if since.elapsed() < Duration::from_millis(400) => {}
                         _ => {
+                            tlog("host", format!("h264 encoder kept a frame > 400 ms (hw={}); falling back", enc.is_hardware));
                             // Encoder swallowed the frame: drop it, fall back (software MFT,
                             // then tiles) and re-send the current screen right away.
                             if enc.is_hardware {
@@ -1001,6 +1076,11 @@ pub fn spawn_capture_worker(
                         }
                         match ready {
                             Some((dims, enc)) => {
+                                tlog("host", format!(
+                                    "h264 encoder ready for {}x{}: {}",
+                                    dims.0, dims.1,
+                                    enc.as_ref().map(|e| e.codec_name.as_str()).unwrap_or("FAILED (using tiles)")
+                                ));
                                 h264_pending = None;
                                 h264_enc = if dims == (tw, th) { enc } else { None };
                                 h264_empty_streak = 0;
@@ -1033,7 +1113,10 @@ pub fn spawn_capture_worker(
                     let want_kf = force_kf || h264_force_next;
                     let mut h264_failed = false;
                     if let Some(enc) = h264_enc.as_mut() {
-                        match enc.encode_bgra(scaled_ref, tw, th, want_kf) {
+                        let t_enc = Instant::now();
+                        let enc_res = enc.encode_bgra(scaled_ref, tw, th, want_kf);
+                        st_encode.add(t_enc.elapsed().as_secs_f64() * 1000.0);
+                        match enc_res {
                             Ok(Some(annex_b)) => {
                                 h264_empty_streak = 0;
                                 h264_force_next = false;
@@ -1056,8 +1139,16 @@ pub fn spawn_capture_worker(
                                     encoding: FrameEncoding::H264AnnexB,
                                     payload: annex_b,
                                 });
-                                if pkt_tx.try_send(pkt).is_ok() {
+                                let sent_len = match &pkt { DataPacket::VideoFrame(v) => v.payload.len(), _ => 0 };
+                            if pkt_tx.try_send(pkt).is_ok() {
                                     abr.lock().unwrap().on_frame_sent(seq);
+                                st_sent += 1;
+                                st_bytes += sent_len as u64;
+                                st_max_frame = st_max_frame.max(sent_len);
+                                if !st_first_frame_logged {
+                                    st_first_frame_logged = true;
+                                    tlog("host", format!("first video frame sent {} ms after worker start ({} kB)", worker_started.elapsed().as_millis(), sent_len / 1024));
+                                }
                                     last_video_sent = Instant::now();
                                     last_sent_h264 = true;
                                 } else {
@@ -1084,6 +1175,7 @@ pub fn spawn_capture_worker(
                     }
                     if h264_failed {
                         let was_hw = h264_enc.as_ref().map(|e| e.is_hardware).unwrap_or(false);
+                        tlog("host", format!("h264 encoder failed (hw={was_hw}, empty_streak={h264_empty_streak}); falling back"));
                         h264_enc = None;
                         h264_awaiting = None;
                         h264_force_next = true;
@@ -1104,9 +1196,10 @@ pub fn spawn_capture_worker(
                         encoder.force_keyframe();
                         last_sent_h264 = false;
                     }
-                    if let Some((ew, eh, payload)) =
-                        encoder.encode_bgra(src_w, src_h, &bgra_buf, max_width, jpeg_quality)
-                    {
+                    let t_enc = Instant::now();
+                    let tiles = encoder.encode_bgra(src_w, src_h, &bgra_buf, max_width, jpeg_quality);
+                    st_encode.add(t_enc.elapsed().as_secs_f64() * 1000.0);
+                    if let Some((ew, eh, payload)) = tiles {
                         let tile_label = "HybridTiles (LZ4+JPEG)";
                         if last_codec_label != tile_label {
                             last_codec_label = tile_label.to_string();
@@ -1126,8 +1219,16 @@ pub fn spawn_capture_worker(
                             encoding: FrameEncoding::HybridTiles,
                             payload,
                         });
-                        if pkt_tx.try_send(pkt).is_ok() {
+                        let sent_len = match &pkt { DataPacket::VideoFrame(v) => v.payload.len(), _ => 0 };
+                            if pkt_tx.try_send(pkt).is_ok() {
                             abr.lock().unwrap().on_frame_sent(seq);
+                                st_sent += 1;
+                                st_bytes += sent_len as u64;
+                                st_max_frame = st_max_frame.max(sent_len);
+                                if !st_first_frame_logged {
+                                    st_first_frame_logged = true;
+                                    tlog("host", format!("first video frame sent {} ms after worker start ({} kB)", worker_started.elapsed().as_millis(), sent_len / 1024));
+                                }
                             last_video_sent = Instant::now();
                         } else {
                             encoder.force_keyframe();

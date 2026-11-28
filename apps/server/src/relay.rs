@@ -9,6 +9,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -307,6 +309,16 @@ pub async fn ws_relay_handler(
 }
 
 const MAX_PENDING_RELAY_FRAMES: usize = 64;
+/// Per-direction relay queue. Each slot can hold a whole video frame, so a deep queue is
+/// pure added latency (bufferbloat); the host's own window keeps at most ~8 frames in flight.
+const RELAY_QUEUE_FRAMES: usize = 24;
+
+#[derive(Default)]
+struct WriteStats {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
 
 fn register_relay_peer(
     room: &mut crate::state::RelayRoom,
@@ -353,13 +365,25 @@ async fn handle_relay_socket(
     role_is_host: bool,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(24);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(RELAY_QUEUE_FRAMES);
+    let role = if role_is_host { "host" } else { "viewer" };
+    let sess_short = session_id.to_string()[..8].to_string();
 
-    let both_connected = {
+    let (both_connected, wait_ms, flushed) = {
         let mut rooms = state.relay_rooms.write().await;
         let room = rooms.entry(session_id).or_default();
-        register_relay_peer(room, role_is_host, tx.clone())
+        let flushed = if role_is_host { room.pending_for_host.len() } else { room.pending_for_viewer.len() };
+        let first = *room.first_join.get_or_insert_with(std::time::Instant::now);
+        let both = register_relay_peer(room, role_is_host, tx.clone());
+        (both, first.elapsed().as_millis(), flushed)
     };
+    if both_connected {
+        tracing::info!(
+            "relay[{sess_short}] {role} joined; pair complete, waited {wait_ms} ms for the first peer, flushed {flushed} queued msgs"
+        );
+    } else {
+        tracing::info!("relay[{sess_short}] {role} joined first; waiting for peer");
+    }
     if both_connected {
         let _ = sqlx::query(
             "UPDATE remote_sessions SET status = 'active', started_at = COALESCE(started_at, now()) WHERE id = $1 AND status = 'pending'",
@@ -369,7 +393,10 @@ async fn handle_relay_socket(
         .await;
     }
 
+    let write_stats = Arc::new(WriteStats::default());
+    let write_stats_task = write_stats.clone();
     let mut send_task = tokio::spawn(async move {
+        let write_stats = write_stats_task;
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(25));
         ping_interval.tick().await;
         loop {
@@ -383,21 +410,64 @@ async fn handle_relay_socket(
                     let Some(bytes) = maybe_bytes else {
                         break;
                     };
+                    let t = std::time::Instant::now();
                     if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
+                    // Time the socket write took = TCP backpressure towards this peer.
+                    let us = t.elapsed().as_micros() as u64;
+                    write_stats.total_us.fetch_add(us, Ordering::Relaxed);
+                    write_stats.max_us.fetch_max(us, Ordering::Relaxed);
+                    write_stats.count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
     });
 
+    let opened = std::time::Instant::now();
+    let mut report = tokio::time::interval(std::time::Duration::from_secs(5));
+    report.tick().await;
+    let (mut win_msgs, mut win_bytes, mut win_max_msg) = (0u64, 0u64, 0usize);
+    let (mut win_fwd_us, mut win_fwd_max_us, mut win_full) = (0u64, 0u64, 0u64);
+    let (mut tot_msgs, mut tot_bytes) = (0u64, 0u64);
     loop {
         tokio::select! {
             _ = &mut send_task => break,
+            _ = report.tick() => {
+                let peer_q = {
+                    let rooms = state.relay_rooms.read().await;
+                    rooms.get(&session_id).and_then(|r| if role_is_host { r.viewer_tx.clone() } else { r.host_tx.clone() })
+                        .map(|p| RELAY_QUEUE_FRAMES - p.capacity())
+                };
+                let wn = write_stats.count.swap(0, Ordering::Relaxed);
+                let wt = write_stats.total_us.swap(0, Ordering::Relaxed);
+                let wmax = write_stats.max_us.swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    "relay[{sess_short}] {role}->peer: {:.1} msg/s {:.0} kB/s max_msg={} kB | fwd wait avg {:.1} ms max {:.1} ms, peer queue full {}x, peer queue now {:?}/{} | write to {role}: {} msgs avg {:.1} ms max {:.1} ms",
+                    win_msgs as f64 / 5.0,
+                    win_bytes as f64 / 5.0 / 1024.0,
+                    win_max_msg / 1024,
+                    if win_msgs > 0 { win_fwd_us as f64 / win_msgs as f64 / 1000.0 } else { 0.0 },
+                    win_fwd_max_us as f64 / 1000.0,
+                    win_full,
+                    peer_q,
+                    RELAY_QUEUE_FRAMES,
+                    wn,
+                    if wn > 0 { wt as f64 / wn as f64 / 1000.0 } else { 0.0 },
+                    wmax as f64 / 1000.0,
+                );
+                tot_msgs += win_msgs;
+                tot_bytes += win_bytes;
+                win_msgs = 0; win_bytes = 0; win_max_msg = 0;
+                win_fwd_us = 0; win_fwd_max_us = 0; win_full = 0;
+            }
             incoming = ws_rx.next() => {
                 let Some(Ok(msg)) = incoming else { break; };
                 match msg {
                     Message::Binary(data) => {
+                        win_msgs += 1;
+                        win_bytes += data.len() as u64;
+                        win_max_msg = win_max_msg.max(data.len());
                         let peer_tx = {
                             let rooms = state.relay_rooms.read().await;
                             rooms.get(&session_id).and_then(|r| {
@@ -409,9 +479,16 @@ async fn handle_relay_socket(
                             })
                         };
                         if let Some(peer) = peer_tx {
+                            if peer.capacity() == 0 {
+                                win_full += 1;
+                            }
+                            let t = std::time::Instant::now();
                             if peer.send(data.to_vec()).await.is_err() {
                                 break;
                             }
+                            let us = t.elapsed().as_micros() as u64;
+                            win_fwd_us += us;
+                            win_fwd_max_us = win_fwd_max_us.max(us);
                         } else {
                             // Peer hasn't joined yet (common across WAN/NAT latency); queue early handshake frames.
                             let peer_after_lock = {
@@ -453,6 +530,12 @@ async fn handle_relay_socket(
     }
 
     send_task.abort();
+    tracing::info!(
+        "relay[{sess_short}] {role} left after {:.1} s; sent {} msgs / {:.1} MB to peer",
+        opened.elapsed().as_secs_f64(),
+        tot_msgs + win_msgs,
+        (tot_bytes + win_bytes) as f64 / 1_048_576.0
+    );
     {
         let mut rooms = state.relay_rooms.write().await;
         if let Some(room) = rooms.get_mut(&session_id) {

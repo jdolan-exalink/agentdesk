@@ -448,7 +448,19 @@ async fn run_incoming_host_session(
     mut stop_rx: watch::Receiver<bool>,
     mut chat_rx: mpsc::UnboundedReceiver<String>,
 ) -> anyhow::Result<()> {
-    let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
+    let t_sess = std::time::Instant::now();
+    agentdesk_protocol::telemetry::tlog("host", "incoming session: connecting to relay");
+    let mut tunnel = match RelayTunnel::connect(&relay_url, false).await {
+        Ok(t) => t,
+        Err(e) => {
+            agentdesk_protocol::telemetry::tlog("host", format!("relay/E2EE connect FAILED after {} ms: {e}", t_sess.elapsed().as_millis()));
+            return Err(e.into());
+        }
+    };
+    agentdesk_protocol::telemetry::tlog("host", format!("relay + Noise E2EE ready in {} ms", t_sess.elapsed().as_millis()));
+    let mut net_send = agentdesk_protocol::telemetry::Stat::default();
+    let mut net_report = std::time::Instant::now();
+    let mut net_udp_frames = 0u32;
     let _wallpaper_guard = WallpaperBlackoutGuard::activate_in_background();
 
     let monitors = enumerate_monitors();
@@ -552,6 +564,7 @@ async fn run_incoming_host_session(
             } => {
                 p2p_ch_rx = None;
                 let addr_str = ch.peer_addr().to_string();
+                agentdesk_protocol::telemetry::tlog("host", format!("P2P UDP ready with {addr_str} after {} ms", t_sess.elapsed().as_millis()));
                 udp_ch = Some(ch);
                 keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::P2pReady {
@@ -587,6 +600,7 @@ async fn run_incoming_host_session(
                 if let Some(ch) = udp_ch.as_mut() {
                     ch.maybe_send_keepalive().await;
                     if !ch.is_alive() {
+                        agentdesk_protocol::telemetry::tlog("host", "P2P UDP went silent; back to relay");
                         udp_ch = None;
                     }
                 }
@@ -809,8 +823,24 @@ async fn run_incoming_host_session(
                 }
             }
             Some(pkt) = pkt_rx.recv() => {
+                let t_send = std::time::Instant::now();
+                let via_udp = udp_ch.as_ref().map(|c| c.is_alive()).unwrap_or(false);
                 if send_adaptive_packet(&mut tunnel, &mut udp_ch, &pkt).await.is_err() {
+                    agentdesk_protocol::telemetry::tlog("host", "video send failed; ending session");
                     break;
+                }
+                net_send.add(t_send.elapsed().as_secs_f64() * 1000.0);
+                if via_udp {
+                    net_udp_frames += 1;
+                }
+                if net_report.elapsed() >= Duration::from_secs(2) {
+                    let st = net_send.take();
+                    agentdesk_protocol::telemetry::tlog("host", format!(
+                        "net: {} video frames, {} via P2P UDP, socket send avg {:.1} ms max {:.1} ms (slow sends here also delay mouse/keyboard)",
+                        st.n, net_udp_frames, st.avg(), st.max
+                    ));
+                    net_udp_frames = 0;
+                    net_report = std::time::Instant::now();
                 }
             }
         }

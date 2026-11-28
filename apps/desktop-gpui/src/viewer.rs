@@ -212,10 +212,25 @@ impl RemoteSession {
         let audio_mute_bg = audio_mute_flag.clone();
 
         let (dec_tx, dec_rx) = std::sync::mpsc::sync_channel::<VideoFrame>(4);
+        // Telemetry shared between the network task and the decoder thread.
+        let tel_queue_drops = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let tel_rtt_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tel_transport = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tel_queue_drops_dec, tel_rtt_dec, tel_transport_dec) =
+            (tel_queue_drops.clone(), tel_rtt_ms.clone(), tel_transport.clone());
         let ev_tx_dec = ev_tx.clone();
         let ack_tx_dec = out_tx.clone();
         std::thread::spawn(move || {
             let mut canvas = ViewerFrameCanvas::new();
+            use agentdesk_protocol::telemetry::{tlog, Stat};
+            let mut st_report = Instant::now();
+            let (mut st_rx, mut st_dec_n, mut st_skip, mut st_kf, mut st_err) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            let mut st_bytes = 0u64;
+            let mut st_dec = Stat::default();
+            let mut st_age = Stat::default();
+            let mut st_codec = String::new();
+            let mut st_first = true;
+            let opened = Instant::now();
             // Create the H.264 decoder now, while the tunnel is still being set up, instead of
             // on the first frame.
             canvas.prewarm_h264();
@@ -229,11 +244,46 @@ impl RemoteSession {
                     bytes_in_window = 0;
                     bw_start = Instant::now();
                 }
+                st_rx += 1;
+                st_bytes += vf.payload.len() as u64;
+                st_codec = format!("{:?} {}x{}", vf.encoding, vf.width, vf.height);
+                // Host wall clock vs ours: only meaningful if both clocks are NTP-synced.
+                let now_wall = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                st_age.add((now_wall - vf.timestamp_ms as i64) as f64);
+                if st_first {
+                    st_first = false;
+                    tlog("viewer", format!("first video frame received {} ms after viewer start: {st_codec}, {} kB", opened.elapsed().as_millis(), vf.payload.len() / 1024));
+                }
+                if st_report.elapsed() >= Duration::from_secs(2) {
+                    let secs = st_report.elapsed().as_secs_f32();
+                    let dec = st_dec.take();
+                    let age = st_age.take();
+                    tlog("viewer", format!(
+                        "video: recv {:.1} fps {:.0} kB/s decoded {:.1} fps (avg {:.1} ms max {:.1} ms) | skipped after loss {} kf_req {} decode_err {} dropped_in_queue {} | rtt {} ms via {} | host->viewer age avg {:.0} ms max {:.0} ms (clock-skew sensitive) | {}",
+                        st_rx as f32 / secs,
+                        st_bytes as f32 / secs / 1024.0,
+                        st_dec_n as f32 / secs,
+                        dec.avg(), dec.max,
+                        st_skip, st_kf, st_err,
+                        tel_queue_drops_dec.swap(0, std::sync::atomic::Ordering::Relaxed),
+                        tel_rtt_dec.load(std::sync::atomic::Ordering::Relaxed),
+                        if tel_transport_dec.load(std::sync::atomic::Ordering::Relaxed) { "P2P UDP" } else { "relay" },
+                        age.avg(), age.max,
+                        st_codec,
+                    ));
+                    st_report = Instant::now();
+                    st_rx = 0; st_dec_n = 0; st_skip = 0; st_kf = 0; st_err = 0; st_bytes = 0;
+                }
                 let admission = canvas.admit(vf.seq, vf.encoding, &vf.payload);
                 if admission.request_keyframe {
+                    st_kf += 1;
                     let _ = ack_tx_dec.send(DataPacket::Control(ControlMessage::RequestKeyframe));
                 }
                 if !admission.decode {
+                    st_skip += 1;
                     // Lost frame: keep the last good image instead of decoding grey smears.
                     // Still ACK so the host's send window keeps moving.
                     let _ = ack_tx_dec.send(DataPacket::Control(ControlMessage::FrameAck {
@@ -246,6 +296,8 @@ impl RemoteSession {
                 match canvas.apply_frame(vf.encoding, vf.width, vf.height, &vf.payload) {
                     Ok((w, h, bgra)) => {
                         let decode_ms = t_dec.elapsed().as_millis().min(u16::MAX as u128) as u16;
+                        st_dec_n += 1;
+                        st_dec.add(t_dec.elapsed().as_secs_f64() * 1000.0);
                         let _ = ack_tx_dec.send(DataPacket::Control(ControlMessage::FrameAck {
                             seq: vf.seq,
                             decode_ms,
@@ -257,7 +309,9 @@ impl RemoteSession {
                             kbps,
                         });
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        st_err += 1;
+                        tlog("viewer", format!("decode error ({:?}): {e}", vf.encoding));
                         let _ = ack_tx_dec.send(DataPacket::Control(ControlMessage::RequestKeyframe));
                     }
                 }
@@ -268,12 +322,14 @@ impl RemoteSession {
         runtime().spawn(async move {
             let stage = |txt: &str| {
                 let secs = connect_started.elapsed().as_secs_f32();
+                agentdesk_protocol::telemetry::tlog("viewer", format!("stage: {txt} at {secs:.2} s"));
                 let _ = ev_tx.send(TunnelEvent::Stage(format!("Negociando · {txt} ({secs:.1} s)")));
             };
             stage("conectando al relay");
             let ws = match connect_ws(&ws_url).await {
                 Ok((ws, _)) => ws,
                 Err(e) => {
+                    agentdesk_protocol::telemetry::tlog("viewer", format!("relay connect FAILED: {e}"));
                     let _ = ev_tx.send(TunnelEvent::Ended(format!("Error Relay: {e}")));
                     return;
                 }
@@ -282,6 +338,7 @@ impl RemoteSession {
             let mut tunnel = match RelayTunnel::handshake_over_ws(ws, true).await {
                 Ok(t) => t,
                 Err(e) => {
+                    agentdesk_protocol::telemetry::tlog("viewer", format!("Noise handshake FAILED: {e}"));
                     let _ = ev_tx.send(TunnelEvent::Ended(format!("Error E2EE: {e}")));
                     return;
                 }
@@ -289,7 +346,8 @@ impl RemoteSession {
             stage("túnel cifrado listo, esperando la primera imagen");
             let audio_player = AudioPlayer::new();
 
-            let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
+            tel_transport.store(false, std::sync::atomic::Ordering::Relaxed);
+                            let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
             let _ = tunnel
                 .send_packet(&DataPacket::Control(ControlMessage::RequestHardwareResources))
                 .await;
@@ -337,6 +395,7 @@ impl RemoteSession {
                             break;
                         }
                         if was_udp && udp_ch.is_none() {
+                            tel_transport.store(false, std::sync::atomic::Ordering::Relaxed);
                             let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
                         }
                     }
@@ -401,6 +460,8 @@ impl RemoteSession {
                         p2p_ch_rx = None;
                         let peer_label = format!("⚡ P2P Directo ({})", ch.peer_addr().ip());
                         udp_ch = Some(ch);
+                        tel_transport.store(true, std::sync::atomic::Ordering::Relaxed);
+                        agentdesk_protocol::telemetry::tlog("viewer", format!("transport: P2P UDP {peer_label}"));
                         let _ = ev_tx.send(TunnelEvent::TransportMode(true, peer_label));
                         let _ = tunnel
                             .send_packet(&DataPacket::Control(ControlMessage::RequestKeyframe))
@@ -426,7 +487,9 @@ impl RemoteSession {
                                                 .await;
                                         }
                                         last_vf_seq = last_vf_seq.max(vf.seq);
-                                        let _ = dec_tx.try_send(vf);
+                                        if dec_tx.try_send(vf).is_err() {
+                                    tel_queue_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                     }
                                     DataPacket::Audio(ap) => {
                                         audio_player
@@ -440,7 +503,9 @@ impl RemoteSession {
                                         let _ = ev_tx.send(TunnelEvent::VideoCodecActive(codec_name, hardware));
                                     }
                                     DataPacket::Control(ControlMessage::Pong { ts_ms }) => {
-                                        let _ = ev_tx.send(TunnelEvent::Rtt(now_ms().saturating_sub(ts_ms)));
+                                        let rtt_v = now_ms().saturating_sub(ts_ms);
+                                tel_rtt_ms.store(rtt_v, std::sync::atomic::Ordering::Relaxed);
+                                let _ = ev_tx.send(TunnelEvent::Rtt(rtt_v));
                                     }
                                     _ => {}
                                 }
@@ -452,7 +517,8 @@ impl RemoteSession {
                             ch.maybe_send_keepalive().await;
                             if !ch.is_alive() {
                                 udp_ch = None;
-                                let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
+                                tel_transport.store(false, std::sync::atomic::Ordering::Relaxed);
+                            let _ = ev_tx.send(TunnelEvent::TransportMode(false, "☁ Relay WSS".into()));
                                 let _ = tunnel
                                     .send_packet(&DataPacket::Control(ControlMessage::RequestKeyframe))
                                     .await;
@@ -471,7 +537,9 @@ impl RemoteSession {
                         match incoming {
                             Ok(DataPacket::VideoFrame(vf)) => {
                                 last_vf_seq = last_vf_seq.max(vf.seq);
-                                let _ = dec_tx.try_send(vf);
+                                if dec_tx.try_send(vf).is_err() {
+                                    tel_queue_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                             Ok(DataPacket::Audio(ap)) => {
                                 audio_player
@@ -498,7 +566,9 @@ impl RemoteSession {
                                 }
                             }
                             Ok(DataPacket::Control(ControlMessage::Pong { ts_ms })) => {
-                                let _ = ev_tx.send(TunnelEvent::Rtt(now_ms().saturating_sub(ts_ms)));
+                                let rtt_v = now_ms().saturating_sub(ts_ms);
+                                tel_rtt_ms.store(rtt_v, std::sync::atomic::Ordering::Relaxed);
+                                let _ = ev_tx.send(TunnelEvent::Rtt(rtt_v));
                             }
                             Ok(DataPacket::Control(ControlMessage::Chat { sender, text })) => {
                                 let _ = ev_tx.send(TunnelEvent::Chat(sender, text));

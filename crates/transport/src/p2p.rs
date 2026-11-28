@@ -303,6 +303,10 @@ pub fn start_host_p2p_handshake(
         };
         let stun = extract_stun_addr_from_ws_url(&relay_url);
         let my_eps = discover_udp_candidates(&sock, stun.as_deref()).await;
+        agentdesk_protocol::telemetry::tlog(
+            "host",
+            format!("p2p: own candidates {:?} (stun {:?})", my_eps, stun),
+        );
         let _ = ep_tx.send(my_eps);
         if let Some(peer) =
             punch_udp_peer(sock.clone(), session_nonce, viewer_endpoints, true).await
@@ -357,6 +361,36 @@ where
 
 /// Attempts direct UDP hole-punching across both LAN and STUN-discovered candidates.
 pub async fn punch_udp_peer(
+    socket: Arc<UdpSocket>,
+    nonce: [u8; 16],
+    endpoints: Vec<String>,
+    is_host: bool,
+) -> Option<SocketAddr> {
+    let role = if is_host { "host" } else { "viewer" };
+    let local = socket.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let t = std::time::Instant::now();
+    agentdesk_protocol::telemetry::tlog(
+        role,
+        format!("p2p: punching from {local} towards {:?}", endpoints),
+    );
+    let res = punch_udp_peer_inner(socket, nonce, endpoints, is_host).await;
+    match res {
+        Some(peer) => agentdesk_protocol::telemetry::tlog(
+            role,
+            format!("p2p: direct UDP path OK with {peer} in {} ms", t.elapsed().as_millis()),
+        ),
+        None => agentdesk_protocol::telemetry::tlog(
+            role,
+            format!(
+                "p2p: FAILED after {} ms (no reply from any candidate: firewall blocking UDP, or no reachable address); staying on relay",
+                t.elapsed().as_millis()
+            ),
+        ),
+    }
+    res
+}
+
+async fn punch_udp_peer_inner(
     socket: Arc<UdpSocket>,
     nonce: [u8; 16],
     endpoints: Vec<String>,

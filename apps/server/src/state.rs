@@ -16,6 +16,8 @@ pub struct RelayRoom {
     pub viewer_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub pending_for_host: Vec<Vec<u8>>,
     pub pending_for_viewer: Vec<Vec<u8>>,
+    /// When the first peer joined; used to log how long the other side took to arrive.
+    pub first_join: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]

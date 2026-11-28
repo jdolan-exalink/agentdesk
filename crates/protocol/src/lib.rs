@@ -1,3 +1,4 @@
+pub mod telemetry;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
