@@ -21,6 +21,7 @@ pub struct HostConfig {
     pub quality: u8,
 }
 
+#[allow(dead_code)]
 fn detect_lan_ip() -> Option<Ipv4Addr> {
     for target in ["8.8.8.8:80", "1.1.1.1:80"] {
         if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
@@ -39,10 +40,7 @@ fn detect_lan_ip() -> Option<Ipv4Addr> {
 }
 
 fn default_server_url() -> String {
-    match detect_lan_ip() {
-        Some(ip) => format!("http://{ip}:8080"),
-        None => "http://127.0.0.1:8080".to_string(),
-    }
+    "https://agentdesk.dolan.com.ar".to_string()
 }
 
 fn default_auto_accept() -> bool {
@@ -50,7 +48,7 @@ fn default_auto_accept() -> bool {
 }
 
 fn default_fps() -> u8 {
-    30
+    60
 }
 
 fn default_quality() -> u8 {

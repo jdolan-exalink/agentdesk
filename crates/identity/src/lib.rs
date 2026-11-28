@@ -12,6 +12,8 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+pub mod release;
+
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const NOISE_MAX_CHUNK_PLAIN: usize = 60 * 1024;
 const NOISE_MAX_PAYLOAD: usize = 16 * 1024 * 1024;

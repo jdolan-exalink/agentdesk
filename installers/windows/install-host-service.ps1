@@ -35,11 +35,15 @@ Copy-Item -Force $BinaryPath $targetExe
 
 & $targetExe --configure-server $ServerUrl
 if (-not [string]::IsNullOrWhiteSpace($EnrollToken)) {
-    $hostCfgDir = Join-Path $env:LOCALAPPDATA "AgentDesk"
-    Write-Host "Enrolando equipo con $ServerUrl antes de registrar el servicio..."
-    $proc = Start-Process -FilePath $targetExe -ArgumentList @("--server", $ServerUrl, "--enroll-token", $EnrollToken, "--auto-accept") -PassThru
-    Start-Sleep -Seconds 3
-    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    # El token NO va en la linea de comandos del servicio (ImagePath es legible por cualquier
+    # usuario local): queda en un archivo de un solo uso, solo SYSTEM y Administradores pueden
+    # leerlo, y el servicio lo borra al enrolarse en el primer arranque.
+    $tokDir = Join-Path $env:ProgramData "AgentDesk"
+    New-Item -ItemType Directory -Force -Path $tokDir | Out-Null
+    $tokFile = Join-Path $tokDir "host-enroll.token"
+    Set-Content -Path $tokFile -Value $EnrollToken.Trim() -NoNewline -Encoding ASCII
+    & icacls.exe $tokFile /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+    Write-Host "Token de enrolamiento guardado para el primer arranque del servicio."
 }
 
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue

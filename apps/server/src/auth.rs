@@ -1,7 +1,5 @@
 use crate::state::{record_audit, ApiError, AppState};
-use agentdesk_identity::{
-    generate_high_entropy_token, hash_password, sha256_hex, verify_password,
-};
+use agentdesk_identity::{generate_high_entropy_token, hash_password, sha256_hex, verify_password};
 use agentdesk_protocol::{AuthResponse, AuthUserInfo, BootstrapRequest, LoginRequest};
 use axum::extract::{FromRequestParts, State};
 use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
@@ -86,7 +84,9 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-pub async fn setup_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn setup_status(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(&state.pool)
         .await?;
@@ -106,7 +106,9 @@ pub async fn bootstrap(
         return Err(ApiError::forbidden("invalid bootstrap token"));
     }
     if req.admin_password.len() < 8 {
-        return Err(ApiError::bad_request("password must be at least 8 characters"));
+        return Err(ApiError::bad_request(
+            "password must be at least 8 characters",
+        ));
     }
 
     let existing_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
@@ -118,17 +120,16 @@ pub async fn bootstrap(
 
     let org_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
-    let pw_hash = hash_password(&req.admin_password).map_err(|e| ApiError::internal(e.to_string()))?;
+    let pw_hash =
+        hash_password(&req.admin_password).map_err(|e| ApiError::internal(e.to_string()))?;
 
     let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)",
-    )
-    .bind(org_id)
-    .bind(req.organization_name.trim())
-    .bind(req.organization_slug.trim().to_lowercase())
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(req.organization_name.trim())
+        .bind(req.organization_slug.trim().to_lowercase())
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         "INSERT INTO users (id, organization_id, email, display_name, password_hash, role)
@@ -144,7 +145,7 @@ pub async fn bootstrap(
 
     let raw_token = generate_high_entropy_token();
     let token_hash = sha256_hex(raw_token.as_bytes());
-    let expires_at = Utc::now() + Duration::days(7);
+    let expires_at = Utc::now() + Duration::days(30);
 
     sqlx::query(
         "INSERT INTO auth_sessions (token_hash, user_id, organization_id, expires_at)
@@ -173,7 +174,7 @@ pub async fn bootstrap(
     .await;
 
     let cookie = format!(
-        "{SESSION_COOKIE_NAME}={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800"
+        "{SESSION_COOKIE_NAME}={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
     );
     let body = AuthResponse {
         token: raw_token,
@@ -196,7 +197,7 @@ pub async fn login(
 ) -> Result<impl IntoResponse, ApiError> {
     let email = req.email.trim().to_lowercase();
     let row = sqlx::query(
-        "SELECT u.id, u.organization_id, o.name AS org_name, u.email, u.display_name, u.password_hash, u.role, u.is_active
+        "SELECT u.id, u.organization_id, o.name AS org_name, u.email, u.display_name, u.password_hash, u.role, u.is_active, u.mfa_enabled, u.mfa_secret
          FROM users u
          JOIN organizations o ON o.id = u.organization_id
          WHERE u.email = $1",
@@ -216,11 +217,28 @@ pub async fn login(
         return Err(ApiError::unauthorized("invalid credentials"));
     }
 
+    let mfa_enabled: bool = row.get("mfa_enabled");
+    if mfa_enabled {
+        let code = req
+            .totp_code
+            .as_deref()
+            .ok_or_else(|| ApiError::unauthorized("mfa_code_required"))?;
+        let secret: Option<String> = row.get("mfa_secret");
+        let valid_code = secret
+            .as_deref()
+            .map(|secret| crate::rmm_ai_api::verify_totp_code(secret, code))
+            .transpose()?
+            .unwrap_or(false);
+        if !valid_code {
+            return Err(ApiError::unauthorized("invalid_mfa_code"));
+        }
+    }
+
     let user_id: Uuid = row.get("id");
     let org_id: Uuid = row.get("organization_id");
     let raw_token = generate_high_entropy_token();
     let token_hash = sha256_hex(raw_token.as_bytes());
-    let expires_at = Utc::now() + Duration::days(7);
+    let expires_at = Utc::now() + Duration::days(30);
 
     sqlx::query(
         "INSERT INTO auth_sessions (token_hash, user_id, organization_id, expires_at)
@@ -247,7 +265,7 @@ pub async fn login(
     .await;
 
     let cookie = format!(
-        "{SESSION_COOKIE_NAME}={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800"
+        "{SESSION_COOKIE_NAME}={raw_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
     );
     let body = AuthResponse {
         token: raw_token,
@@ -291,7 +309,16 @@ pub async fn logout(
     Ok(([(SET_COOKIE, clear_cookie)], Json(json!({ "ok": true }))))
 }
 
-pub async fn me(auth: AuthContext) -> Json<AuthUserInfo> {
+pub async fn me(State(state): State<AppState>, auth: AuthContext) -> Json<AuthUserInfo> {
+    let token_hash = sha256_hex(auth.raw_token.as_bytes());
+    let renewed = Utc::now() + Duration::days(30);
+    let _ = sqlx::query(
+        "UPDATE auth_sessions SET expires_at = GREATEST(expires_at, $2) WHERE token_hash = $1 AND revoked_at IS NULL",
+    )
+    .bind(&token_hash)
+    .bind(renewed)
+    .execute(&state.pool)
+    .await;
     Json(auth.user)
 }
 
@@ -303,7 +330,9 @@ pub async fn change_password(
     let cur = req.current_password.trim();
     let next = req.new_password.trim();
     if next.len() < 6 {
-        return Err(ApiError::bad_request("La nueva contraseña debe tener al menos 6 caracteres"));
+        return Err(ApiError::bad_request(
+            "La nueva contraseña debe tener al menos 6 caracteres",
+        ));
     }
 
     let row = sqlx::query("SELECT password_hash FROM users WHERE id = $1")

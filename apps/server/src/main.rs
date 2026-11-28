@@ -3,6 +3,7 @@ use agentdesk_server::{build_router, config::ServerConfig, state::AppState};
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -114,6 +115,17 @@ async fn run_server(
         lan_ip.clone(),
         public_url.clone(),
     );
+    let metrics_interval_secs = std::env::var("AGENTDESK_RMM_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(60, 86_400);
+    agentdesk_server::rmm_ai_api::spawn_metrics_collector(
+        state.clone(),
+        Duration::from_secs(metrics_interval_secs),
+    );
+    tracing::info!(metrics_interval_secs, "scheduled RMM metric collection enabled");
+    agentdesk_server::stun::spawn_stun_responder();
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

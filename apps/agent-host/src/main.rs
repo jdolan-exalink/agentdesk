@@ -1,27 +1,33 @@
 mod config;
 
 use agentdesk_capture::win::{
-    current_process_private_mb, enumerate_monitors, inject_input_event, inject_special_combo,
-    write_clipboard_text, WindowsCapturer,
+    clipboard_sequence_number, current_process_private_mb, enumerate_monitors,
+    inject_special_combo, read_clipboard_files, read_clipboard_text, write_clipboard_files,
+    write_clipboard_text, WallpaperBlackoutGuard, WindowsCapturer,
 };
-use agentdesk_capture::{encode_frame, ScreenCapturer};
+use agentdesk_capture::{
+    encode_frame, enumerate_printers, print_file_to_printer, spawn_audio_capture_worker,
+    AbrController, ScreenCapturer, WhiteboardOverlay,
+};
 use agentdesk_identity::DeviceIdentity;
 use agentdesk_protocol::{
     AgentToServerMessage, ControlMessage, DataPacket, EnrollDeviceRequest, EnrollDeviceResponse,
-    FrameEncoding, ServerToAgentMessage, VideoFrame,
+    FileDropTarget, FrameEncoding, ServerToAgentMessage,
 };
-use agentdesk_transport::RelayTunnel;
+use agentdesk_transport::{
+    connect_ws, enumerate_local_mac_and_ips, send_adaptive_packet, send_wol_magic_packets,
+    start_host_p2p_handshake, store_received_file_for_target, verify_sha256_hex, P2pUdpChannel,
+    RelayTunnel,
+};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, ValueEnum};
 use config::{normalize_server_url, HostConfig};
 use futures_util::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -30,6 +36,17 @@ use uuid::Uuid;
 enum AgentMode {
     Host,
     Quicksupport,
+}
+
+fn default_agent_mode() -> AgentMode {
+    #[cfg(feature = "quicksupport")]
+    {
+        AgentMode::Quicksupport
+    }
+    #[cfg(not(feature = "quicksupport"))]
+    {
+        AgentMode::Host
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -51,7 +68,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     show_config: bool,
 
-    #[arg(long, value_enum, default_value_t = AgentMode::Host)]
+    #[arg(long, value_enum, default_value_t = default_agent_mode())]
     mode: AgentMode,
 
     #[arg(long)]
@@ -73,11 +90,77 @@ struct Cli {
     quality: Option<u8>,
 }
 
+#[allow(dead_code)]
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn enroll_token_file() -> PathBuf {
+    std::env::var("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("AgentDesk")
+        .join("host-enroll.token")
+}
+
+fn read_enroll_token_file() -> Option<String> {
+    let raw = std::fs::read_to_string(enroll_token_file()).ok()?;
+    let tok = raw.trim_start_matches('\u{feff}').trim().to_string();
+    (!tok.is_empty()).then_some(tok)
+}
+
+fn remove_enroll_token_file() {
+    let _ = std::fs::remove_file(enroll_token_file());
+}
+
+/// Rewrites this service's command line without `--enroll-token <secret>` (services
+/// installed by AgentDesk <= 0.1.6 had it there, readable by any local user).
+#[cfg(windows)]
+fn scrub_service_enroll_token() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut kept: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--enroll-token" {
+            let _ = args.next();
+            continue;
+        }
+        if a.starts_with("--enroll-token=") {
+            continue;
+        }
+        kept.push(a);
+    }
+    if !kept.iter().any(|a| a == "--service") {
+        kept.insert(0, "--service".into());
+    }
+    // sc.exe reads \" as a literal quote inside binPath=.
+    let quote = |s: &str| {
+        if s.contains(' ') {
+            format!(r#"\"{s}\""#)
+        } else {
+            s.to_string()
+        }
+    };
+    let mut bin = format!(r#"\"{}\""#, exe.display());
+    for a in &kept {
+        bin.push(' ');
+        bin.push_str(&quote(a));
+    }
+    let status = std::process::Command::new("sc.exe")
+        .args(["config", win_service::SERVICE_NAME, "binPath="])
+        .raw_arg(format!("\"{bin}\""))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status();
+    match status {
+        Ok(st) if st.success() => {
+            tracing::info!("Enrollment token removed from the service command line")
+        }
+        other => tracing::warn!(?other, "Could not remove the enrollment token from the service command line"),
+    }
 }
 
 fn identity_path() -> PathBuf {
@@ -382,10 +465,29 @@ async fn run_agent(
         "quicksupport"
     };
 
+    // The enrollment token is a secret: it must never live in the service command line
+    // (the service's ImagePath in the registry is readable by every local user). Installers
+    // drop it in an admin-only one-shot file instead; env var and CLI still work for manual runs.
+    let file_token = if cli.mode == AgentMode::Host { read_enroll_token_file() } else { None };
+    let has_saved_creds = host_cfg_opt
+        .as_ref()
+        .is_some_and(|(c, _)| c.device_id.is_some() && c.device_token.is_some());
+    let enroll_token: Option<String> = file_token
+        .clone()
+        .or_else(|| {
+            std::env::var("AGENTDESK_ENROLL_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        // A service installed by an older version still carries the token: once enrolled,
+        // ignore it instead of re-enrolling on every start.
+        .or_else(|| if cli.service && has_saved_creds { None } else { cli.enroll_token.clone() });
+
     let (device_id, public_code, device_token) = if let Some((ref mut cfg, ref cfg_path)) =
         host_cfg_opt
     {
-        if cli.enroll_token.is_none() {
+        if enroll_token.is_none() {
             if let (Some(did), Some(dtok)) = (cfg.device_id, cfg.device_token.clone()) {
                 let pcode = cfg
                     .public_code
@@ -399,6 +501,7 @@ async fn run_agent(
                 );
                 (did, pcode, dtok)
             } else {
+                let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
                 let http = reqwest::Client::new();
                 let resp: EnrollDeviceResponse = http
                     .post(format!("{server}/api/v1/devices/enroll"))
@@ -414,6 +517,8 @@ async fn run_agent(
                         screen_width: screen_w as i32,
                         screen_height: screen_h as i32,
                         private_mem_mb: current_process_private_mb(),
+                        mac_addresses,
+                        lan_ips,
                     })
                     .send()
                     .await?
@@ -429,11 +534,12 @@ async fn run_agent(
                 (resp.device_id, resp.public_code, resp.device_token)
             }
         } else {
+            let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
             let http = reqwest::Client::new();
             let resp: EnrollDeviceResponse = http
                 .post(format!("{server}/api/v1/devices/enroll"))
                 .json(&EnrollDeviceRequest {
-                    enrollment_token: cli.enroll_token.clone(),
+                    enrollment_token: enroll_token.clone(),
                     support_code: cli.support_code.clone(),
                     ed25519_pubkey: identity.public_key_hex(),
                     hostname: host_name.clone(),
@@ -444,6 +550,8 @@ async fn run_agent(
                     screen_width: screen_w as i32,
                     screen_height: screen_h as i32,
                     private_mem_mb: current_process_private_mb(),
+                    mac_addresses,
+                    lan_ips,
                 })
                 .send()
                 .await?
@@ -457,9 +565,13 @@ async fn run_agent(
             cfg.fps = effective_fps;
             cfg.quality = effective_quality;
             cfg.save(cfg_path)?;
+            if file_token.is_some() {
+                remove_enroll_token_file();
+            }
             (resp.device_id, resp.public_code, resp.device_token)
         }
     } else {
+        let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
         let http = reqwest::Client::new();
         let resp: EnrollDeviceResponse = http
             .post(format!("{server}/api/v1/devices/enroll"))
@@ -475,6 +587,8 @@ async fn run_agent(
                 screen_width: screen_w as i32,
                 screen_height: screen_h as i32,
                 private_mem_mb: current_process_private_mb(),
+                mac_addresses,
+                lan_ips,
             })
             .send()
             .await?
@@ -483,6 +597,11 @@ async fn run_agent(
             .await?;
         (resp.device_id, resp.public_code, resp.device_token)
     };
+
+    #[cfg(windows)]
+    if cli.service && cli.enroll_token.is_some() {
+        scrub_service_enroll_token();
+    }
 
     tracing::info!(
         %device_id,
@@ -503,7 +622,7 @@ async fn run_agent(
     let agent_ws_url = format!("{ws_base}/ws/agent?device_id={device_id}&token={device_token}");
 
     loop {
-        match connect_async(&agent_ws_url).await {
+        match connect_ws(&agent_ws_url).await {
             Ok((ws_stream, _)) => {
                 let (mut ws_tx, mut ws_rx) = ws_stream.split();
                 let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<AgentToServerMessage>();
@@ -518,16 +637,23 @@ async fn run_agent(
                     }
                 });
 
+                agentdesk_protocol::telemetry::enable_forwarding();
                 let hb_tx = ctrl_tx.clone();
                 let hb_task = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(10));
                     loop {
                         interval.tick().await;
+                        let (mac_addresses, lan_ips) = enumerate_local_mac_and_ips();
                         let _ = hb_tx.send(AgentToServerMessage::Heartbeat {
                             screen_width: screen_w as i32,
                             screen_height: screen_h as i32,
                             private_mem_mb: current_process_private_mb(),
+                            mac_addresses,
+                            lan_ips,
                         });
+                        for (role, lines) in agentdesk_protocol::telemetry::drain_for_server() {
+                            let _ = hb_tx.send(AgentToServerMessage::Telemetry { role, lines });
+                        }
                     }
                 });
 
@@ -650,6 +776,22 @@ async fn run_agent(
                                                 });
                                             });
                                         }
+                                        ServerToAgentMessage::SendWakeOnLan {
+                                            request_id,
+                                            mac_addresses,
+                                            broadcast_ips,
+                                        } => {
+                                            let tx_rep = ctrl_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let sent_count = send_wol_magic_packets(&mac_addresses, &broadcast_ips);
+                                                let _ = tx_rep.send(AgentToServerMessage::WolResult {
+                                                    request_id,
+                                                    ok: sent_count > 0,
+                                                    sent_count,
+                                                    detail: format!("Paquetes UDP enviados en LAN: {sent_count}"),
+                                                });
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -723,6 +865,7 @@ fn run_diagnostic_sync(
 struct PendingUpload {
     filename: String,
     expected_sha256: String,
+    target: FileDropTarget,
     data: Vec<u8>,
 }
 
@@ -733,7 +876,20 @@ async fn run_host_session(
     initial_quality: u8,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut tunnel = RelayTunnel::connect(&relay_url, false).await?;
+    let t_sess = std::time::Instant::now();
+    agentdesk_protocol::telemetry::tlog("host", "incoming session: connecting to relay");
+    let mut tunnel = match RelayTunnel::connect(&relay_url, false).await {
+        Ok(t) => t,
+        Err(e) => {
+            agentdesk_protocol::telemetry::tlog("host", format!("relay/E2EE connect FAILED after {} ms: {e}", t_sess.elapsed().as_millis()));
+            return Err(e.into());
+        }
+    };
+    agentdesk_protocol::telemetry::tlog("host", format!("relay + Noise E2EE ready in {} ms", t_sess.elapsed().as_millis()));
+    let mut net_send = agentdesk_protocol::telemetry::Stat::default();
+    let mut net_report = std::time::Instant::now();
+    let mut net_udp_frames = 0u32;
+    let _wallpaper_guard = WallpaperBlackoutGuard::activate_in_background();
     tracing::info!("Noise_XX E2EE session established with viewer");
 
     let monitors = enumerate_monitors();
@@ -744,60 +900,61 @@ async fn run_host_session(
         }))
         .await;
 
-    let (pkt_tx, mut pkt_rx) = mpsc::channel::<DataPacket>(4);
-    let quality = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(initial_quality));
-    let fps = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(initial_fps));
+    let (pkt_tx, mut pkt_rx) = mpsc::channel::<DataPacket>(2);
+    let (cursor_tx, mut cursor_rx) = mpsc::channel::<DataPacket>(4);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<DataPacket>(6);
+    let mut abr_init = AbrController::new();
+    // Native resolution, adaptive; the configured quality/fps are the starting point and fps cap.
+    abr_init.set_policy(0, initial_quality.clamp(25, 95), initial_fps.clamp(1, 60), true);
+    let abr = std::sync::Arc::new(std::sync::Mutex::new(abr_init));
     let monitor_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keyframe_req = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let codec_pref = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let audio_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-    let q_cap = quality.clone();
-    let f_cap = fps.clone();
-    let m_cap = monitor_idx.clone();
-    let cap_stop = stop_rx.clone();
+    agentdesk_capture::spawn_capture_worker(
+        stop_rx.clone(),
+        abr.clone(),
+        monitor_idx.clone(),
+        keyframe_req.clone(),
+        codec_pref.clone(),
+        pkt_tx,
+        cursor_tx,
+    );
+    spawn_audio_capture_worker(stop_rx.clone(), audio_enabled.clone(), audio_tx);
 
-    std::thread::spawn(move || {
-        let mut active_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
-        let mut cap = WindowsCapturer::new_for_monitor(active_mon);
-        let mut seq = 0u64;
-        while !*cap_stop.borrow() {
-            let desired_mon = m_cap.load(std::sync::atomic::Ordering::Relaxed);
-            if desired_mon != active_mon {
-                if cap.switch_monitor(desired_mon) {
-                    active_mon = desired_mon;
-                } else {
-                    m_cap.store(active_mon, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            let target_fps = f_cap.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
-            let frame_budget = Duration::from_millis(1000 / target_fps);
-            let t0 = Instant::now();
-
-            if let Ok(raw) = cap.capture_rgba() {
-                let q = q_cap.load(std::sync::atomic::Ordering::Relaxed);
-                if let Ok(payload) = encode_frame(&raw, FrameEncoding::Jpeg, q) {
-                    seq += 1;
-                    let pkt = DataPacket::VideoFrame(VideoFrame {
-                        seq,
-                        timestamp_ms: now_ms(),
-                        width: raw.width,
-                        height: raw.height,
-                        encoding: FrameEncoding::Jpeg,
-                        payload,
-                    });
-                    let _ = pkt_tx.try_send(pkt);
-                }
-            }
-
-            let elapsed = t0.elapsed();
-            if elapsed < frame_budget {
-                std::thread::sleep(frame_budget - elapsed);
-            }
-        }
-    });
-
+    let whiteboard = WhiteboardOverlay::new();
+    let mut injector = agentdesk_capture::RemoteInputInjector::new();
+    if let Some(text) = injector.startup_notice() {
+        let _ = tunnel
+            .send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text }))
+            .await;
+    }
+    // The hardware snapshot shells out to PowerShell/WMI (seconds, far longer on domain-joined
+    // servers). It must never run inside the session loop: while it ran, video, input and the
+    // whiteboard all stopped, and the viewer polls it every 10 s.
+    let (hw_tx, mut hw_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let hw_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pending_print_jobs: std::collections::VecDeque<(Uuid, Option<String>)> =
+        std::collections::VecDeque::new();
     let mut uploads: HashMap<Uuid, PendingUpload> = HashMap::new();
+    let mut udp_ch: Option<P2pUdpChannel> = None;
+    let mut p2p_ep_rx: Option<tokio::sync::oneshot::Receiver<Vec<String>>> = None;
+    let mut p2p_ch_rx: Option<tokio::sync::oneshot::Receiver<P2pUdpChannel>> = None;
+    let mut p2p_meta: Option<([u8; 16], [u8; 32])> = None;
+    let mut udp_buf = vec![0u8; 2048];
+    let mut ka_tick = tokio::time::interval(Duration::from_secs(1));
+    // The viewer pings every 2 s. If nothing arrives for 30 s it is gone (window killed,
+    // network dropped) and the relay keeps our socket open, so end the session here instead of
+    // showing "sesión activa" forever.
+    let mut last_peer_rx = std::time::Instant::now();
+    let mut clip_tick = tokio::time::interval(Duration::from_millis(250));
+    let mut last_clip_seq = clipboard_sequence_number();
+    let mut last_clip_text = read_clipboard_text().unwrap_or_default();
 
     loop {
         tokio::select! {
+            biased;
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
                     let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Terminate {
@@ -806,31 +963,217 @@ async fn run_host_session(
                     break;
                 }
             }
-            Some(pkt) = pkt_rx.recv() => {
-                if tunnel.send_packet(&pkt).await.is_err() {
+            _ = clip_tick.tick() => {
+                let seq = clipboard_sequence_number();
+                if seq != last_clip_seq {
+                    last_clip_seq = seq;
+                    let files = read_clipboard_files();
+                    if !files.is_empty() {
+                        let _ = tunnel.send_files_to_target(&files, FileDropTarget::Clipboard).await;
+                    } else if let Some(txt) = read_clipboard_text() {
+                        if !txt.is_empty() && txt != last_clip_text {
+                            last_clip_text = txt.clone();
+                            let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::ClipboardText { text: txt })).await;
+                        }
+                    }
+                }
+            }
+            p2p_res = async {
+                match p2p_ep_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                p2p_ep_rx = None;
+                // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                // receiver in place, the next loop polled it again and tokio panicked ("called
+                // after complete"), killing the whole session task: frozen image, no input.
+                let Ok(my_eps) = p2p_res else { continue };
+                if let Some((session_nonce, p2p_key)) = p2p_meta {
+                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::P2pOffer {
+                        session_nonce,
+                        p2p_key,
+                        endpoints: my_eps,
+                    })).await;
+                }
+            }
+            p2p_res = async {
+                match p2p_ch_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                p2p_ch_rx = None;
+                // A failed P2P attempt drops the sender. Matching `Some(..)` used to leave the
+                // receiver in place, the next loop polled it again and tokio panicked ("called
+                // after complete"), killing the whole session task: frozen image, no input.
+                let Ok(ch) = p2p_res else { continue };
+                let addr_str = ch.peer_addr().to_string();
+                tracing::info!(peer = %addr_str, "Direct P2P UDP channel active");
+                agentdesk_protocol::telemetry::tlog("host", format!("P2P UDP ready with {addr_str} after {} ms", t_sess.elapsed().as_millis()));
+                udp_ch = Some(ch);
+                keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::P2pReady {
+                    remote_addr: addr_str,
+                })).await;
+            }
+            udp_recv = async {
+                match udp_ch.as_ref() {
+                    Some(ch) => ch.socket().recv_from(&mut udp_buf).await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some((n, _)) = udp_recv {
+                    last_peer_rx = std::time::Instant::now();
+                    if let Some(pkt) = udp_ch.as_mut().and_then(|c| c.try_feed_datagram(&udp_buf[..n])) {
+                        match pkt {
+                            DataPacket::Input(ev) => {
+                                if allow_control {
+                                    if let Some(text) = injector.inject(&ev) {
+                                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                                    }
+                                }
+                            }
+                            DataPacket::Control(ControlMessage::Ping { ts_ms }) => {
+                                let _ = send_adaptive_packet(&mut tunnel, &mut udp_ch, &DataPacket::Control(ControlMessage::Pong { ts_ms })).await;
+                            }
+                            DataPacket::Control(ControlMessage::FrameAck { seq, decode_ms }) => {
+                                abr.lock().unwrap().on_ack_measured(seq, decode_ms);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ = ka_tick.tick() => {
+                if last_peer_rx.elapsed() > std::time::Duration::from_secs(30) {
+                    agentdesk_capture::hostdiag::log("session ended: no packets from the viewer for 30 s");
+                    break;
+                }
+                if let Some(ch) = udp_ch.as_mut() {
+                    ch.maybe_send_keepalive().await;
+                    if !ch.is_alive() {
+                        agentdesk_protocol::telemetry::tlog("host", "P2P UDP went silent; back to relay");
+                        udp_ch = None;
+                    }
+                }
+            }
+            Some(cur_pkt) = cursor_rx.recv() => {
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &cur_pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
                     break;
                 }
             }
+            Some(audio_pkt) = audio_rx.recv() => {
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &audio_pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
+                    break;
+                }
+            }
+            Some(pkt) = pkt_rx.recv() => {
+                let t_send = std::time::Instant::now();
+                let via_udp = udp_ch.as_ref().map(|c| c.is_alive()).unwrap_or(false);
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), send_adaptive_packet(&mut tunnel, &mut udp_ch, &pkt)).await, Ok(Ok(()))) { // viewer not reading for 15 s = gone
+                    agentdesk_protocol::telemetry::tlog("host", "video send failed; ending session");
+                    break;
+                }
+                net_send.add(t_send.elapsed().as_secs_f64() * 1000.0);
+                if via_udp {
+                    net_udp_frames += 1;
+                }
+                if net_report.elapsed() >= Duration::from_secs(2) {
+                    let st = net_send.take();
+                    agentdesk_protocol::telemetry::tlog("host", format!(
+                        "net: {} video frames, {} via P2P UDP, socket send avg {:.1} ms max {:.1} ms (slow sends here also delay mouse/keyboard)",
+                        st.n, net_udp_frames, st.avg(), st.max
+                    ));
+                    net_udp_frames = 0;
+                    net_report = std::time::Instant::now();
+                }
+            }
+            Some(resources_json) = hw_rx.recv() => {
+                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot { resources_json })).await;
+            }
             incoming = tunnel.recv_packet() => {
+                last_peer_rx = std::time::Instant::now();
                 match incoming {
                     Ok(DataPacket::Input(ev)) => {
                         if allow_control {
-                            inject_input_event(&ev);
+                            if let Some(text) = injector.inject(&ev) {
+                                let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Chat { sender: "AgentDesk".into(), text })).await;
+                            }
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::Ping { ts_ms })) => {
-                        let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::Pong { ts_ms })).await;
+                        let _ = send_adaptive_packet(&mut tunnel, &mut udp_ch, &DataPacket::Control(ControlMessage::Pong { ts_ms })).await;
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FrameAck { seq, decode_ms })) => {
+                        abr.lock().unwrap().on_ack_measured(seq, decode_ms);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::RequestKeyframe)) => {
+                        keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Ok(DataPacket::Control(ControlMessage::SetQuality { jpeg_quality, max_fps })) => {
-                        quality.store(jpeg_quality.clamp(25, 95), std::sync::atomic::Ordering::Relaxed);
-                        fps.store(max_fps.clamp(1, 60), std::sync::atomic::Ordering::Relaxed);
+                        abr.lock().unwrap().set_legacy_quality(jpeg_quality, max_fps);
+                        keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::StreamPolicy { max_width, jpeg_quality, max_fps, auto_adapt })) => {
+                        abr.lock().unwrap().set_policy(max_width, jpeg_quality, max_fps, auto_adapt);
+                        keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::P2pOffer { session_nonce, p2p_key, endpoints })) => {
+                        p2p_meta = Some((session_nonce, p2p_key));
+                        let (ep_rx, ch_rx) = start_host_p2p_handshake(relay_url.clone(), session_nonce, p2p_key, endpoints);
+                        p2p_ep_rx = Some(ep_rx);
+                        p2p_ch_rx = Some(ch_rx);
                     }
                     Ok(DataPacket::Control(ControlMessage::SelectMonitor { index })) => {
                         monitor_idx.store(index, std::sync::atomic::Ordering::Relaxed);
+                        whiteboard.set_monitor(index);
+                        injector.set_monitor(index);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::AudioControl { enabled })) => {
+                        audio_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::VideoCodecPolicy { preference })) => {
+                        let v = match preference {
+                            agentdesk_protocol::VideoCodecPreference::Auto => 0,
+                            agentdesk_protocol::VideoCodecPreference::HardwareH264 => 1,
+                            agentdesk_protocol::VideoCodecPreference::HybridTiles => 2,
+                        };
+                        codec_pref.store(v, std::sync::atomic::Ordering::Relaxed);
+                        keyframe_req.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::WhiteboardToggle { active })) => {
+                        whiteboard.set_visible(active);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::WhiteboardStroke(stroke))) => {
+                        whiteboard.add_stroke(stroke);
+                    }
+                    Ok(DataPacket::Control(ControlMessage::WhiteboardUndo)) => {
+                        whiteboard.undo();
+                    }
+                    Ok(DataPacket::Control(ControlMessage::WhiteboardClear)) => {
+                        whiteboard.clear();
+                    }
+                    Ok(DataPacket::Control(ControlMessage::RequestPrinters)) => {
+                        let printers = tokio::task::spawn_blocking(enumerate_printers)
+                            .await
+                            .unwrap_or_default();
+                        let _ = tunnel
+                            .send_packet(&DataPacket::Control(ControlMessage::PrinterList { printers }))
+                            .await;
+                    }
+                    Ok(DataPacket::Control(ControlMessage::RemotePrintJob {
+                        job_id,
+                        printer_name,
+                        ..
+                    })) => {
+                        pending_print_jobs.push_back((job_id, printer_name));
                     }
                     Ok(DataPacket::Control(ControlMessage::ClipboardText { text })) => {
                         if allow_control {
                             write_clipboard_text(&text);
+                            last_clip_text = text;
+                            last_clip_seq = clipboard_sequence_number();
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::SpecialKey { combo })) => {
@@ -839,14 +1182,14 @@ async fn run_host_session(
                         }
                     }
                     Ok(DataPacket::Control(ControlMessage::RequestHardwareResources)) => {
-                        let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                            .await
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let _ = tunnel
-                            .send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                                resources_json: hw.to_string(),
-                            }))
-                            .await;
+                        if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                            tokio::task::spawn_blocking(move || {
+                                let hw = agentdesk_rmm::collect_hardware_resources();
+                                busy.store(false, std::sync::atomic::Ordering::Release);
+                                let _ = hw_done_tx.send(hw.to_string());
+                            });
+                        }
                     }
                     Ok(DataPacket::Control(ControlMessage::SessionAction { action, target_user, delay_secs })) => {
                         if allow_control {
@@ -867,12 +1210,14 @@ async fn run_host_session(
                                     let _ = tokio::task::spawn_blocking(move || agentdesk_rmm::sign_out_windows_user(sid.as_deref())).await;
                                 }
                                 "list_users" => {
-                                    let hw = tokio::task::spawn_blocking(agentdesk_rmm::collect_hardware_resources)
-                                        .await
-                                        .unwrap_or_else(|_| serde_json::json!({}));
-                                    let _ = tunnel.send_packet(&DataPacket::Control(ControlMessage::HardwareResourcesSnapshot {
-                                        resources_json: hw.to_string(),
-                                    })).await;
+                                    if !hw_busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                        let (hw_done_tx, busy) = (hw_tx.clone(), hw_busy.clone());
+                                        tokio::task::spawn_blocking(move || {
+                                            let hw = agentdesk_rmm::collect_hardware_resources();
+                                            busy.store(false, std::sync::atomic::Ordering::Release);
+                                            let _ = hw_done_tx.send(hw.to_string());
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -880,13 +1225,20 @@ async fn run_host_session(
                     }
                     Ok(DataPacket::Control(ControlMessage::FileOffer { transfer_id, filename, size_bytes, sha256 })) => {
                         if size_bytes <= 64 * 1024 * 1024 {
-                            let safe_name = PathBuf::from(&filename)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| format!("archivo_{transfer_id}.bin"));
                             uploads.insert(transfer_id, PendingUpload {
-                                filename: safe_name,
+                                filename,
                                 expected_sha256: sha256,
+                                target: FileDropTarget::Downloads,
+                                data: Vec::with_capacity(size_bytes as usize),
+                            });
+                        }
+                    }
+                    Ok(DataPacket::Control(ControlMessage::FileOfferEx { transfer_id, filename, size_bytes, sha256, target })) => {
+                        if size_bytes <= 64 * 1024 * 1024 {
+                            uploads.insert(transfer_id, PendingUpload {
+                                filename,
+                                expected_sha256: sha256,
+                                target,
                                 data: Vec::with_capacity(size_bytes as usize),
                             });
                         }
@@ -896,18 +1248,42 @@ async fn run_host_session(
                             up.data.extend_from_slice(&data);
                             if eof {
                                 let finished = uploads.remove(&transfer_id).unwrap();
-                                let actual_sha = hex::encode(Sha256::digest(&finished.data));
-                                let (ok, msg) = if !finished.expected_sha256.is_empty() && actual_sha != finished.expected_sha256 {
+                                let (ok, msg) = if !verify_sha256_hex(&finished.expected_sha256, &finished.data) {
                                     (false, format!("SHA-256 no coincide para {}", finished.filename))
                                 } else {
-                                    let base = std::env::var("USERPROFILE")
-                                        .map(PathBuf::from)
-                                        .unwrap_or_else(|_| std::env::temp_dir());
-                                    let dest_dir = base.join("Downloads").join("AgentDesk");
-                                    let _ = std::fs::create_dir_all(&dest_dir);
-                                    let dest_path = dest_dir.join(&finished.filename);
-                                    match std::fs::write(&dest_path, &finished.data) {
-                                        Ok(()) => (true, format!("Recibido en {}", dest_path.display())),
+                                    match store_received_file_for_target(finished.target, transfer_id, &finished.filename, &finished.data) {
+                                        Ok(dest_path) => {
+                                            if finished.target == FileDropTarget::Clipboard {
+                                                let _ = write_clipboard_files(&[dest_path.clone()]);
+                                                last_clip_seq = clipboard_sequence_number();
+                                                (true, format!("Archivo copiado al portapapeles remoto: {}", finished.filename))
+                                            } else if finished.target == FileDropTarget::RemotePrint {
+                                                let (job_id, printer_hint) = pending_print_jobs
+                                                    .pop_front()
+                                                    .unwrap_or((transfer_id, None));
+                                                let p_clone = dest_path.clone();
+                                                let hint_clone = printer_hint.clone();
+                                                let print_res = tokio::task::spawn_blocking(move || {
+                                                    print_file_to_printer(&p_clone, hint_clone.as_deref())
+                                                })
+                                                .await
+                                                .unwrap_or_else(|e| Err(e.to_string()));
+                                                let (p_ok, p_msg) = match print_res {
+                                                    Ok(m) => (true, m),
+                                                    Err(e) => (false, e),
+                                                };
+                                                let _ = tunnel
+                                                    .send_packet(&DataPacket::Control(ControlMessage::RemotePrintResult {
+                                                        job_id,
+                                                        ok: p_ok,
+                                                        message: p_msg.clone(),
+                                                    }))
+                                                    .await;
+                                                (p_ok, p_msg)
+                                            } else {
+                                                (true, format!("Recibido en {}", dest_path.display()))
+                                            }
+                                        }
                                         Err(e) => (false, format!("Error escribiendo archivo: {e}")),
                                     }
                                 };
@@ -928,6 +1304,7 @@ async fn run_host_session(
         }
     }
 
-    let _ = tunnel.close().await;
+    // A peer that stopped reading would block the close handshake forever.
+    let _ = tokio::time::timeout(Duration::from_secs(3), tunnel.close()).await;
     Ok(())
 }

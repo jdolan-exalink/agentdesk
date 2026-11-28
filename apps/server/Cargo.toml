@@ -12,7 +12,9 @@ path = "src/main.rs"
 agentdesk-ai.workspace = true
 agentdesk-identity.workspace = true
 agentdesk-protocol.workspace = true
+hex.workspace = true
 agentdesk-rmm.workspace = true
+agentdesk-transport.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
@@ -42,3 +44,6 @@ tokio-tungstenite.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+[build-dependencies]
+embed-resource = "3"
